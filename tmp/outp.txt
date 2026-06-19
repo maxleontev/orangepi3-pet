@@ -1,0 +1,44 @@
+U-Boot SPL 2024.01-g (Jan 08 2024 - 15:37:48 +0000)
+DRAM: 2048 MiB
+Trying to boot from MMC1
+NOTICE:  BL31: v2.10.4(release):lts-v2.10.4-dirty
+NOTICE:  BL31: Built : 16:23:33, Apr 26 2024
+NOTICE:  BL31: Detected Allwinner H6 SoC (1728)
+NOTICE:  BL31: Found U-Boot DTB at 0xa09a898, model: OrangePi 3 LTS
+
+
+U-Boot 2024.01-g (Jan 08 2024 - 15:37:48 +0000) Allwinner Technology
+
+CPU:   Allwinner H6 (SUN50I)
+Model: OrangePi 3 LTS
+DRAM:  2 GiB
+Core:  66 devices, 18 uclasses, devicetree: separate
+WDT:   Not starting watchdog@7020400
+MMC:   mmc@4020000: 0, mmc@4021000: 2, mmc@4022000: 1
+Loading Environment from FAT... Unable to read "uboot.env" from mmc0:1...
+In:    serial@5000000
+Out:   serial@5000000
+Err:   serial@5000000
+Net:   No ethernet found.
+starting USB...
+Bus usb@5101000: USB EHCI 1.00
+Bus usb@5101400: USB OHCI 1.0
+Bus usb@5200000: Register 2000140 NbrPorts 2
+Starting the controller
+USB XHCI 1.00
+Bus usb@5311000: USB EHCI 1.00
+Bus usb@5311400: USB OHCI 1.0
+scanning bus usb@5101000 for devices... 1 USB Device(s) found
+scanning bus usb@5101400 for devices... 1 USB Device(s) found
+scanning bus usb@5200000 for devices... 3 USB Device(s) found
+scanning bus usb@5311000 for devices... 1 USB Device(s) found
+scanning bus usb@5311400 for devices... 1 USB Device(s) found
+       scanning usb for storage devices... 0 Storage Device(s) found
+Hit any key to stop autoboot:  0
+switch to partitions #0, OK
+mmc0 is current device
+Scanning mmc 0:1...
+Found U-Boot script /boot.scr
+495 bytes read in 7 ms (68.4 KiB/s)
+## Executing script at 4fc00000
+Failed to load 'allwinner/sun50i-h6-orangepi-3-lts.dtb'
