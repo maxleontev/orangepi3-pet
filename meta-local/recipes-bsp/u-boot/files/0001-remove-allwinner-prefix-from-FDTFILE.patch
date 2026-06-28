@@ -1,0 +1,14 @@
+--- a/include/configs/sunxi-common.h
++++ b/include/configs/sunxi-common.h
+@@ -315,5 +315,5 @@
+-#ifdef CONFIG_ARM64
+-#define FDTFILE "allwinner/" CONFIG_DEFAULT_DEVICE_TREE ".dtb"
+-#else
+-#define FDTFILE CONFIG_DEFAULT_DEVICE_TREE ".dtb"
+-#endif
++#ifdef CONFIG_ARM64
++#define FDTFILE "sun50i-h6-orangepi-3-lts.dtb"
++#else
++#define FDTFILE "sun50i-h6-orangepi-3-lts.dtb"
++#endif
+

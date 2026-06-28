@@ -1,0 +1,5 @@
+--- a/include/configs/sunxi-common.h
++++ b/include/configs/sunxi-common.h
+@@ -316,1 +316,1 @@
+-#define FDTFILE "allwinner/" CONFIG_DEFAULT_DEVICE_TREE ".dtb"
++#define FDTFILE CONFIG_DEFAULT_DEVICE_TREE ".dtb"

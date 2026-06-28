@@ -1,0 +1,5 @@
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -834,1 +834,1 @@
+-		char *prefix = IS_ENABLED(CONFIG_ARM64) ? "allwinner/" : "";
++		char *prefix = "";
