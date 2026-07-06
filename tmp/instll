@@ -1,13 +1,9 @@
 # sudo apt install -y build-essential gawk wget git-core diffstat unzip texinfo chrpath socat cpio python3 python3-pip python3-pexpect xz-utils debianutils iputils-ping python3-git python3-jinja2 python3-subunit zstd liblz4-tool file locales ca-certificates
 
-
-
 # git clone -b scarthgap https://git.yoctoproject.org/poky.git
-
 # git clone -b scarthgap https://git.openembedded.org/meta-openembedded.git
 # git clone -b scarthgap https://github.com/linux-sunxi/meta-sunxi.git
 # git clone -b scarthgap git://git.yoctoproject.org/meta-arm.git
-# git clone -b walnascar https://github.com/balister/meta-sdr.git
 
 #   source poky/oe-init-build-env build-orangepi3
 
