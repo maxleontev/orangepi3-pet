@@ -1,0 +1,14 @@
+[Unit]
+Description=WiFi connection
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/sbin/ip link set wlan0 up
+ExecStartPre=/usr/sbin/wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf
+ExecStart=/sbin/udhcpc -i wlan0 -b
+ExecStop=/usr/bin/killall wpa_supplicant udhcpc
+
+[Install]
+WantedBy=multi-user.target
