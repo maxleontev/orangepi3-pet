@@ -5,7 +5,7 @@ echo "rm"
 rm  core-image-base-orange-pi-3lts.rootfs-2026*.wic*
 
 echo "cp"
-cp ~/projects/orangepi3-sdr/build-orangepi3/tmp/deploy/images/orange-pi-3lts/core-image-base-orange-pi-3lts.rootfs-2026*.wic.gz .
+cp ../build-orangepi3/tmp/deploy/images/orange-pi-3lts/core-image-base-orange-pi-3lts.rootfs-2026*.wic.gz .
 
 echo "gunzip"
 gunzip  core-image-base-orange-pi-3lts.rootfs-2026*.wic.gz
