@@ -1,0 +1,6 @@
+#!/bin/bash
+
+
+sudo dd if=/dev/zero of=/dev/sda bs=4M status=progress oflag=sync
+
+sync
