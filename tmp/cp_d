@@ -1,7 +1,6 @@
 #!/bin/bash
 
-#FILE="core-image-base-orange-pi-3lts.rootfs-2026"
-FILE="core-image-orangepi3-orange-pi-3lts.rootfs-2026"
+FILE="core-image-khepri-orange-pi-3lts.rootfs-2026"
 
 
 echo "rm"
