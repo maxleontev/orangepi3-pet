@@ -1,4 +1,4 @@
-SUMMARY = "Orange Pi 3 LTS image with WiFi and local user setup"
+SUMMARY = "Orange Pi 3 image with WiFi and local user setup"
 DESCRIPTION = "Console image based on core-image-base, plus AP6256 WiFi \
 support, Midnight Commander, and a preconfigured local user."
 LICENSE = "MIT"
