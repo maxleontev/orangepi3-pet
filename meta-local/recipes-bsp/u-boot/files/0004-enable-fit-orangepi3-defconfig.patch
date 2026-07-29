@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: meta-local <meta-local@local>
+Date: Wed, 29 Jul 2026 00:00:00 +0000
+Subject: [PATCH] orangepi_3_defconfig: enable FIT image support
+
+Enable CONFIG_FIT and CONFIG_OF_LIBFDT so that U-Boot can load and
+parse FIT images produced by the Yocto kernel-fitimage class.
+
+diff --git a/configs/orangepi_3_defconfig b/configs/orangepi_3_defconfig
+--- a/configs/orangepi_3_defconfig
++++ b/configs/orangepi_3_defconfig
+@@ -5,6 +5,8 @@ CONFIG_MACH_SUN50I_H6=y
+ CONFIG_SUNXI_DRAM_H6_LPDDR3=y
+ CONFIG_MMC_SUNXI_SLOT_EXTRA=2
+ CONFIG_BLUETOOTH_DT_DEVICE_FIXUP="brcm,bcm4345c5"
++CONFIG_FIT=y
++CONFIG_OF_LIBFDT=y
+ # CONFIG_SYS_MALLOC_CLEAR_ON_INIT is not set
+ CONFIG_PHY_SUN50I_USB3=y
+ CONFIG_USB_XHCI_HCD=y
