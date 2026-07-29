@@ -12,7 +12,11 @@ do_install() {
     install -d ${D}${base_libdir}/firmware/brcm
     install -m 0644 ${WORKDIR}/brcmfmac43456-sdio.bin ${D}${base_libdir}/firmware/brcm/
     install -m 0644 ${WORKDIR}/brcmfmac43456-sdio.txt ${D}${base_libdir}/firmware/brcm/
+    # Board-specific names requested by brcmfmac from DTB compatible
     ln -sf brcmfmac43456-sdio.bin ${D}${base_libdir}/firmware/brcm/brcmfmac43456-sdio.xunlong,orangepi-3-lts.bin
+    ln -sf brcmfmac43456-sdio.txt ${D}${base_libdir}/firmware/brcm/brcmfmac43456-sdio.xunlong,orangepi-3-lts.txt
+    ln -sf brcmfmac43456-sdio.bin ${D}${base_libdir}/firmware/brcm/brcmfmac43456-sdio.xunlong,orangepi-3.bin
+    ln -sf brcmfmac43456-sdio.txt ${D}${base_libdir}/firmware/brcm/brcmfmac43456-sdio.xunlong,orangepi-3.txt
 }
 
 FILES:${PN} = "${base_libdir}/firmware/brcm/*"
