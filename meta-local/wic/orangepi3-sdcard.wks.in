@@ -1,0 +1,17 @@
+# short-description: SD card image for Orange Pi 3 (non-LTS, Allwinner H6)
+# long-description:
+# Orange Pi 3 (non-LTS) has non-standard MMC numbering in Linux (SD is
+# mmcblk2, eMMC is mmcblk1, WiFi SDIO is mmcblk0). Use LABEL=boot in
+# fstab so /boot mounts correctly regardless of boot media.
+#
+#  - --------------------------- -------------- --------------
+# | | u-boot-sunxi-with-spl.bin |     boot     |    rootfs    |
+#  - --------------------------- -------------- --------------
+# ^ ^                           ^              ^              ^
+# | |                           |              |              |
+# 0 |                         2MiB  ${SUNXI_BOOT_SPACE}MiB  ${SUNXI_BOOT_SPACE}MiB + rootfs
+#   8KiB
+
+part u-boot --source rawcopy --sourceparams="file=${SPL_BINARY}" --ondisk mmcblk0 --no-table --align 8
+part /boot  --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot --active --align 2048 --fixed-size ${SUNXI_BOOT_SPACE} --use-label
+part /      --source rootfs --ondisk mmcblk0 --fstype=ext4 --label rootfs --align 2048

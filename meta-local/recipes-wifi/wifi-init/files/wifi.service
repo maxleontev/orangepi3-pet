@@ -1,10 +1,15 @@
 [Unit]
 Description=WiFi connection
-After=network.target
+Wants=network.target
+After=network.target systemd-modules-load.service
+# Do not use ConditionPathExists here — wlan0 appears asynchronously
+# after brcmfmac firmware load; ExecStartPre waits for it instead.
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# Retry until wlan0 appears (SDIO + firmware can take a few seconds)
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -d /sys/class/net/wlan0 ] && exit 0; sleep 1; done; echo "wlan0 not found"; exit 1'
 ExecStartPre=/sbin/ip link set wlan0 up
 ExecStartPre=/usr/sbin/wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf
 ExecStart=/sbin/udhcpc -i wlan0 -b
