@@ -1,24 +1,31 @@
 #!/bin/bash
 
-FILE="core-image-khepri-orange-pi-3lts.rootfs-2026"
+IMAGE="core-image-khepri-orange-pi-3.rootfs"
+SRC="../build-orangepi3/tmp/deploy/images/orange-pi-3"
+WIC_GZ="${SRC}/${IMAGE}.wic.gz"
+WIC="${IMAGE}.wic"
 
+if [ ! -f "${WIC_GZ}" ]; then
+	echo "Missing image: ${WIC_GZ}" >&2
+	exit 1
+fi
 
 echo "rm"
-rm ${FILE}*.wic*
+rm -f "${WIC}" "${WIC}.gz"
 
 echo "cp"
-cp ../build-orangepi3/tmp/deploy/images/orange-pi-3lts/${FILE}*.wic.gz .
+cp "${WIC_GZ}" .
 
 echo "gunzip"
-gunzip ${FILE}*.wic.gz
+gunzip -f "${IMAGE}.wic.gz"
 
 echo "dd"
-sudo dd if=$(ls ${FILE}*.wic) of=/dev/sda bs=4M status=progress
+sudo dd if="${WIC}" of=/dev/sda bs=4M status=progress
 
 echo "sync"
 sync
 
 echo "rm"
-rm ${FILE}*.wic*
+rm -f "${WIC}"
 
 echo "done"
