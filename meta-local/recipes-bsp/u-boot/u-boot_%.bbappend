@@ -4,10 +4,11 @@ SRC_URI:append = " file://0001-remove-allwinner-prefix-from-FDTFILE.patch"
 
 SRC_URI:append = " file://0002-remove-allwinner-prefix-from-board.patch"
 
-# Orange Pi 3 (non-LTS): FIT-capable U-Boot + boot script with correct MMC
-# device mapping (SD -> mmcblk2, eMMC -> mmcblk1) and fitImage/bootm.
+# Orange Pi 3 (non-LTS): GPT-friendly SPL@128K sector fix, FIT support,
+# and boot script resolving partitions by GPT name.
 SRC_URI:append:orange-pi-3 = " \
     file://0004-enable-fit-orangepi3-defconfig.patch \
+    file://0005-sunxi-always-high-spl-uboot-sector.patch \
     file://boot-orangepi3.cmd \
 "
 

@@ -4,14 +4,16 @@ support, Midnight Commander, and a preconfigured local user. Boots via a \
 FIT image (kernel + DTB + minimal initramfs)."
 LICENSE = "MIT"
 
-IMAGE_FEATURES += "splash"
+# read-only-rootfs: fstab/cmdline tweaks + dropbear key dir defaults (we
+# override the key dir onto /data below so host keys survive reboot).
+IMAGE_FEATURES += "splash read-only-rootfs"
 
 IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc"
 
 # Must match INITRAMFS_IMAGE in linux-mainline bbappend (kernel recipe scope).
 # Deployed FIT with ramdisk is named fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};
 # copy it to the boot partition as plain "fitImage" for boot.scr.
-INITRAMFS_IMAGE ?= "core-image-minimal-initramfs"
+INITRAMFS_IMAGE ?= "core-image-initramfs-boot"
 IMAGE_BOOT_FILES = "fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};fitImage boot.scr"
 
 inherit core-image extrausers
@@ -21,3 +23,20 @@ EXTRA_USERS_PARAMS = " \
     groupadd -g 880 newgroup; \
     usermod -G newgroup max; \
 "
+
+# GPT layout: /data is R/W (wic adds LABEL=data). Persist dropbear host keys
+# there — without this, socket-activated dropbear fails keygen on R/O /etc
+# and SSH clients see "Connection reset by peer".
+ROOTFS_POSTPROCESS_COMMAND += "khepri_gpt_rootfs_layout;"
+khepri_gpt_rootfs_layout() {
+    mkdir -p ${IMAGE_ROOTFS}/data
+    if [ -f ${IMAGE_ROOTFS}/etc/default/dropbear ]; then
+        sed -i '/^DROPBEAR_RSAKEY_DIR=/d' ${IMAGE_ROOTFS}/etc/default/dropbear
+        echo 'DROPBEAR_RSAKEY_DIR=/data/dropbear' >> ${IMAGE_ROOTFS}/etc/default/dropbear
+    fi
+    mkdir -p ${IMAGE_ROOTFS}/etc/systemd/system/dropbearkey.service.d
+    cat > ${IMAGE_ROOTFS}/etc/systemd/system/dropbearkey.service.d/data-keys.conf << 'EOF'
+[Unit]
+RequiresMountsFor=/data
+EOF
+}

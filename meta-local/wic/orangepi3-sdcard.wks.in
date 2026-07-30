@@ -1,17 +1,25 @@
-# short-description: SD card image for Orange Pi 3 (non-LTS, Allwinner H6)
+# short-description: GPT SD/eMMC image for Orange Pi 3 (non-LTS)
 # long-description:
-# Orange Pi 3 (non-LTS) has non-standard MMC numbering in Linux (SD is
-# mmcblk2, eMMC is mmcblk1, WiFi SDIO is mmcblk0). Use LABEL=boot in
-# fstab so /boot mounts correctly regardless of boot media.
+# Custom GPT layout (partition names + filesystem labels):
+#   boot   (FAT/vfat)  — FIT image + boot.scr
+#   rootfs (ext4, R/O) — system root
+#   data   (ext4, R/W) — persistent application data
 #
-#  - --------------------------- -------------- --------------
-# | | u-boot-sunxi-with-spl.bin |     boot     |    rootfs    |
-#  - --------------------------- -------------- --------------
-# ^ ^                           ^              ^              ^
-# | |                           |              |              |
-# 0 |                         2MiB  ${SUNXI_BOOT_SPACE}MiB  ${SUNXI_BOOT_SPACE}MiB + rootfs
-#   8KiB
+# Allwinner BROM + GPT:
+#   A standard GPT entry array occupies LBA 2..33 and collides with the
+#   legacy SPL location at 8 KiB. H6 also probes 128 KiB for eGON — place
+#   the combined SPL+U-Boot blob there. U-Boot is patched to always apply
+#   the high-location sector fixup so U-Boot proper is found even if the
+#   BROM leaves the HIGH bit clear in boot_media.
+#
+#  - -------------- --------------------------- ---------- ------------ ------
+# | | GPT (LBA0-33) | u-boot-sunxi-with-spl.bin |   boot   |   rootfs   | data |
+#  - -------------- --------------------------- ---------- ------------ ------
+# ^                 ^ 128KiB                    ^ 2MiB
 
-part u-boot --source rawcopy --sourceparams="file=${SPL_BINARY}" --ondisk mmcblk0 --no-table --align 8
-part /boot  --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot --active --align 2048 --fixed-size ${SUNXI_BOOT_SPACE} --use-label
-part /      --source rootfs --ondisk mmcblk0 --fstype=ext4 --label rootfs --align 2048
+bootloader --ptable gpt
+
+part u-boot --source rawcopy --sourceparams="file=${SPL_BINARY}" --ondisk mmcblk0 --no-table --align 128
+part /boot --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot --part-name boot --align 2048 --fixed-size ${SUNXI_BOOT_SPACE} --use-label
+part / --source rootfs --ondisk mmcblk0 --fstype=ext4 --label rootfs --part-name rootfs --align 2048 --fixed-size 256 --use-label
+part /data --ondisk mmcblk0 --fstype=ext4 --label data --part-name data --align 2048 --size 100 --use-label

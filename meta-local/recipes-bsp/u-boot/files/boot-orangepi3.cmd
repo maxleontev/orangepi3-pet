@@ -1,23 +1,15 @@
-# Orange Pi 3 (non-LTS) FIT boot script.
+# Orange Pi 3 (non-LTS) FIT boot script — GPT partition layout.
 #
-# MMC numbering differs between U-Boot and Linux on this board:
-#   U-Boot mmc0 (4020000) = SD slot   -> Linux mmcblk2
-#   U-Boot mmc1 (4022000) = eMMC      -> Linux mmcblk1
-#   U-Boot mmc2 (4021000) = WiFi SDIO -> Linux mmcblk0 (no partitions)
+# GPT partition names (PARTLABEL / U-Boot part name):
+#   boot   — FAT, holds fitImage + boot.scr
+#   rootfs — ext4, mounted read-only by the kernel
+#   data   — ext4, mounted read-write at /data by fstab
 #
-# The SPL stores the boot source in SRAM at offset 0x28:
-#   0x00 = SD (mmc0)  -> rootdev=mmcblk2p2
-#   0x02 = eMMC (mmc1) -> rootdev=mmcblk1p2
-#
-# Boot payload is a single FIT image (kernel + DTB + minimal initramfs).
-# Load FIT at kernel_comp_addr_r (0x44000000), NOT kernel_addr_r
-# (0x40080000): the gzip-compressed kernel decompresses to ~0x40008000
-# and would overwrite a FIT sitting at kernel_addr_r (inflate -3).
-rootdev=mmcblk2p2
-if itest.b *0x28 == 0x02 ; then
-	echo "U-Boot loaded from eMMC"
-	rootdev=mmcblk1p2
-fi
-setenv bootargs console=${console} console=tty1 root=/dev/${rootdev} rootwait panic=10 ${extra}
-load mmc ${devnum}:1 ${kernel_comp_addr_r} fitImage || load mmc ${devnum}:1 ${kernel_comp_addr_r} boot/fitImage
+# SPL+U-Boot live at 128 KiB (past the GPT entry array). Load FIT at
+# kernel_comp_addr_r so gzip decompress does not overwrite the FIT.
+
+setenv bootpart 1
+part number mmc ${devnum} boot bootpart
+setenv bootargs console=${console} console=tty1 root=PARTLABEL=rootfs rootfstype=ext4 ro rootwait panic=10 ${extra}
+load mmc ${devnum}:${bootpart} ${kernel_comp_addr_r} fitImage || load mmc ${devnum}#boot ${kernel_comp_addr_r} fitImage
 bootm ${kernel_comp_addr_r}
