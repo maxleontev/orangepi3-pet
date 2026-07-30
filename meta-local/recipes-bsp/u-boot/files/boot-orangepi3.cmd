@@ -3,7 +3,7 @@
 # GPT partition names (PARTLABEL / U-Boot part name):
 #   boot   — FAT, holds fitImage + boot.scr
 #   rootfs — ext4, mounted read-only by the kernel
-#   data   — ext4, mounted read-write at /data by fstab
+#   data   — F2FS, mounted read-write at /data (relatime,discard) by fstab
 #
 # SPL+U-Boot live at 128 KiB (past the GPT entry array). Load FIT at
 # kernel_comp_addr_r so gzip decompress does not overwrite the FIT.

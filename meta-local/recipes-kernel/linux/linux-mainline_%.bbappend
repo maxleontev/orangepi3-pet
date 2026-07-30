@@ -4,8 +4,13 @@
 # bitbake does not propagate image-recipe vars into virtual/kernel.
 # IMAGE_BOOT_FILES is set in core-image-khepri.bb.
 
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+
 KERNEL_CLASSES:append:orange-pi-3 = " kernel-fitimage"
 KERNEL_IMAGETYPES:append:orange-pi-3 = " fitImage"
+
+# F2FS for the GPT data partition (LABEL=data).
+SRC_URI:append:orange-pi-3 = " file://f2fs.cfg"
 
 # Small initramfs that mounts root= and switch_root's — NOT the live/installer
 # image (core-image-minimal-initramfs), which mounts partitions R/W first and
