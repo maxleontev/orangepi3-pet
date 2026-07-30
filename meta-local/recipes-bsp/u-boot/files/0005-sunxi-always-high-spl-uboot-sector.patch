@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: meta-local <meta-local@local>
+Date: Thu, 30 Jul 2026 00:00:00 +0000
+Subject: [PATCH] sunxi: always apply 128K SPL offset for U-Boot proper
+
+Orange Pi 3 GPT images install u-boot-sunxi-with-spl.bin at 128 KiB so
+the blob does not collide with the GPT partition-entry array at LBA
+2..33. The H6 BROM loads that SPL, but boot_media does not always have
+the HIGH bit set. In that case stock U-Boot looks for U-Boot proper at
+the legacy 40 KiB sector and hangs at "Trying to boot from MMC1".
+
+Always add the high-location sector fixup so U-Boot proper is read from
+160 KiB (128 KiB SPL base + 32 KiB SPL pad), matching the on-disk layout.
+
+diff --git a/arch/arm/mach-sunxi/board.c b/arch/arm/mach-sunxi/board.c
+--- a/arch/arm/mach-sunxi/board.c
++++ b/arch/arm/mach-sunxi/board.c
+@@ -346,12 +346,12 @@ unsigned long board_spl_mmc_get_uboot_raw_sector(struct mmc *mmc,
+ 
+ 	sector = max(raw_sect, spl_size / 512);
+ 
+-	switch (sunxi_get_boot_source()) {
+-	case SUNXI_BOOTED_FROM_MMC0_HIGH:
+-	case SUNXI_BOOTED_FROM_MMC2_HIGH:
+-		sector += (128 - 8) * 2;
+-		break;
+-	}
++	/*
++	 * GPT SD/eMMC images place the combined firmware at 128 KiB.
++	 * Always apply the high-location offset; do not rely on the BROM
++	 * HIGH bit in boot_media (often clear on H6).
++	 */
++	sector += (128 - 8) * 2;
+ 
+ 	return sector;
+ }
