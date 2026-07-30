@@ -10,6 +10,6 @@
 
 setenv bootpart 1
 part number mmc ${devnum} boot bootpart
-setenv bootargs console=${console} console=tty1 root=PARTLABEL=rootfs rootfstype=ext4 ro rootwait panic=10 ${extra}
+setenv bootargs console=${console} console=tty1 root=PARTLABEL=rootfs rootfstype=ext4 ro rootflags=noatime rootwait panic=10 ${extra}
 load mmc ${devnum}:${bootpart} ${kernel_comp_addr_r} fitImage || load mmc ${devnum}#boot ${kernel_comp_addr_r} fitImage
 bootm ${kernel_comp_addr_r}

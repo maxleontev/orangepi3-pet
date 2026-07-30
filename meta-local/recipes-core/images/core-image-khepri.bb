@@ -27,9 +27,14 @@ EXTRA_USERS_PARAMS = " \
 # GPT layout: /data is R/W (wic adds LABEL=data). Persist dropbear host keys
 # there — without this, socket-activated dropbear fails keygen on R/O /etc
 # and SSH clients see "Connection reset by peer".
-ROOTFS_POSTPROCESS_COMMAND += "khepri_gpt_rootfs_layout;"
+# Run after read_only_rootfs_hook (append, not +=) so fstab tweaks stick.
+ROOTFS_POSTPROCESS_COMMAND:append = " khepri_gpt_rootfs_layout;"
 khepri_gpt_rootfs_layout() {
     mkdir -p ${IMAGE_ROOTFS}/data
+    if grep -q '^/dev/root' ${IMAGE_ROOTFS}/etc/fstab; then
+        sed -i 's|^\(/dev/root[[:space:]]\+/[[:space:]]\+auto[[:space:]]\+\)[^[:space:]]*|\1ro,noatime|' \
+            ${IMAGE_ROOTFS}/etc/fstab
+    fi
     if [ -f ${IMAGE_ROOTFS}/etc/default/dropbear ]; then
         sed -i '/^DROPBEAR_RSAKEY_DIR=/d' ${IMAGE_ROOTFS}/etc/default/dropbear
         echo 'DROPBEAR_RSAKEY_DIR=/data/dropbear' >> ${IMAGE_ROOTFS}/etc/default/dropbear
