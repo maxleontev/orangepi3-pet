@@ -26,8 +26,7 @@ EXTRA_USERS_PARAMS = " \
 
 # GPT layout: /data is F2FS R/W (empty-f2fs WIC plugin; fstab owned here so
 # mount options are correct — WIC has no --fstype=f2fs). Persist dropbear
-# host keys there — without this, socket-activated dropbear fails keygen on
-# R/O /etc and SSH clients see "Connection reset by peer".
+# host keys and (via volatile-binds OverlayFS) /var/lib,/var/log there.
 # Run after read_only_rootfs_hook (append, not +=) so fstab tweaks stick.
 ROOTFS_POSTPROCESS_COMMAND:append = " khepri_gpt_rootfs_layout;"
 khepri_gpt_rootfs_layout() {
@@ -40,6 +39,18 @@ khepri_gpt_rootfs_layout() {
     sed -i '/[[:space:]]\/data[[:space:]]/d' ${IMAGE_ROOTFS}/etc/fstab
     printf 'LABEL=data\t/data\tf2fs\trelatime,discard\t0\t0\n' \
         >> ${IMAGE_ROOTFS}/etc/fstab
+
+    # /var/log must be a real RO directory for data-var-log.service overlay.
+    if [ -L ${IMAGE_ROOTFS}/var/log ]; then
+        rm -f ${IMAGE_ROOTFS}/var/log
+        mkdir -p ${IMAGE_ROOTFS}/var/log
+    fi
+    # Drop any tmpfiles rule that would recreate log -> volatile/log.
+    if [ -f ${IMAGE_ROOTFS}/usr/lib/tmpfiles.d/00-create-volatile.conf ]; then
+        sed -i '\|[[:space:]]/var/log[[:space:]].*volatile/log|d' \
+            ${IMAGE_ROOTFS}/usr/lib/tmpfiles.d/00-create-volatile.conf
+    fi
+
     if [ -f ${IMAGE_ROOTFS}/etc/default/dropbear ]; then
         sed -i '/^DROPBEAR_RSAKEY_DIR=/d' ${IMAGE_ROOTFS}/etc/default/dropbear
         echo 'DROPBEAR_RSAKEY_DIR=/data/dropbear' >> ${IMAGE_ROOTFS}/etc/default/dropbear
