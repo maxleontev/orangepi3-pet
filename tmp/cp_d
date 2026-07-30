@@ -10,6 +10,10 @@ if [ ! -f "${WIC_GZ}" ]; then
 	exit 1
 fi
 
+WIC_GZ_REAL=$(readlink -f "${WIC_GZ}")
+echo "image: ${WIC_GZ_REAL}"
+echo "created: $(stat -c '%y' "${WIC_GZ_REAL}" | cut -d. -f1)"
+
 echo "rm"
 rm -f "${WIC}" "${WIC}.gz"
 
@@ -29,3 +33,4 @@ echo "rm"
 rm -f "${WIC}"
 
 echo "done"
+printf '\a'
