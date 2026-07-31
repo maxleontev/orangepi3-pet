@@ -1,10 +1,13 @@
 # short-description: GPT SD/eMMC image for Orange Pi 3 (non-LTS)
 # long-description:
-# Custom GPT layout (partition names + filesystem labels), A/B-ready:
-#   boot      (FAT/vfat)  — FIT image + boot.scr
-#   rootfs_a  (ext4, R/O) — active system root (slot A)
-#   rootfs_b  (ext4, R/O) — inactive slot B (empty until A/B switching)
+# Custom GPT layout (partition names + filesystem labels), A/B:
+#   boot      (FAT/vfat)  — boot.scr, fitImage_a/b, uboot.env
+#   rootfs_a  (ext4, R/O) — system root slot A
+#   rootfs_b  (ext4, R/O) — system root slot B (empty until first A/B update)
 #   data      (F2FS, R/W) — persistent application data (fstab from image recipe)
+#
+# Slot selection is U-Boot env bootslot (default a); see boot-orangepi3.cmd
+# and the ab-update package.
 #
 # Allwinner BROM + GPT:
 #   A standard GPT entry array occupies LBA 2..33 and collides with the

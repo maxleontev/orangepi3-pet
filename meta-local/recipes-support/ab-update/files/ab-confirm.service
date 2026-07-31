@@ -1,0 +1,13 @@
+[Unit]
+Description=Confirm successful A/B slot boot
+Documentation=file:///usr/sbin/ab-update
+After=local-fs.target
+RequiresMountsFor=/boot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ab-confirm
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
