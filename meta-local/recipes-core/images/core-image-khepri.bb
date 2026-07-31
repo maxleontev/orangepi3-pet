@@ -8,7 +8,7 @@ LICENSE = "MIT"
 # override the key dir onto /data below so host keys survive reboot).
 IMAGE_FEATURES += "splash read-only-rootfs"
 
-IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc"
+IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc sd-to-emmc"
 
 # Must match INITRAMFS_IMAGE in linux-mainline bbappend (kernel recipe scope).
 # Deployed FIT with ramdisk is named fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};
