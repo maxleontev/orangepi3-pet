@@ -8,7 +8,7 @@ LICENSE = "MIT"
 # override the key dir onto /data below so host keys survive reboot).
 IMAGE_FEATURES += "splash read-only-rootfs"
 
-IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc sd-to-emmc"
+IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc sd-to-emmc root-ssh-keys"
 
 # Must match INITRAMFS_IMAGE in linux-mainline bbappend (kernel recipe scope).
 # Deployed FIT with ramdisk is named fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};
@@ -18,8 +18,17 @@ IMAGE_BOOT_FILES = "fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};fitImage boot.sc
 
 inherit core-image extrausers
 
+# Root may SSH in with a key (allow-root-login); empty-password logins disabled.
+# Dropbear -g (below) blocks root password auth over SSH. Console password for
+# root matches user max (same crypt salt/hash).
+IMAGE_FEATURES:remove = "empty-root-password allow-empty-password"
+IMAGE_FEATURES += "allow-root-login"
+
+KHEPRI_USER_PASSWD = "\$5\$Uvx6JzQlgbPV\$LJMPCCUmmybpQOz/LAx5P5FzLC0NnkHqiTDZG1rtBL6"
+
 EXTRA_USERS_PARAMS = " \
-    useradd -d /home/max -m -s /bin/sh -p '\$5\$Uvx6JzQlgbPV\$LJMPCCUmmybpQOz/LAx5P5FzLC0NnkHqiTDZG1rtBL6' max; \
+    usermod -p '${KHEPRI_USER_PASSWD}' root; \
+    useradd -d /home/max -m -s /bin/sh -p '${KHEPRI_USER_PASSWD}' max; \
     groupadd -g 880 newgroup; \
     usermod -G newgroup max; \
 "
@@ -53,6 +62,10 @@ khepri_gpt_rootfs_layout() {
     fi
 
     if [ -f ${IMAGE_ROOTFS}/etc/default/dropbear ]; then
+        # allow-root-login clears -w; set -g so root SSH is key-only (no password).
+        sed -i '/^DROPBEAR_EXTRA_ARGS=/d' ${IMAGE_ROOTFS}/etc/default/dropbear
+        sed -i '/^# Disallow root/d' ${IMAGE_ROOTFS}/etc/default/dropbear
+        printf 'DROPBEAR_EXTRA_ARGS="-g"\n' >> ${IMAGE_ROOTFS}/etc/default/dropbear
         sed -i '/^DROPBEAR_RSAKEY_DIR=/d' ${IMAGE_ROOTFS}/etc/default/dropbear
         echo 'DROPBEAR_RSAKEY_DIR=/data/dropbear' >> ${IMAGE_ROOTFS}/etc/default/dropbear
     fi
