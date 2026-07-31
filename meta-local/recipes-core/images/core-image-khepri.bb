@@ -8,13 +8,17 @@ LICENSE = "MIT"
 # override the key dir onto /data below so host keys survive reboot).
 IMAGE_FEATURES += "splash read-only-rootfs"
 
-IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc sd-to-emmc root-ssh-keys"
+IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc sd-to-emmc root-ssh-keys ab-update"
 
 # Must match INITRAMFS_IMAGE in linux-mainline bbappend (kernel recipe scope).
 # Deployed FIT with ramdisk is named fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};
-# copy it to the boot partition as plain "fitImage" for boot.scr.
+# install only as fitImage_a / fitImage_b (boot.scr selects by bootslot).
 INITRAMFS_IMAGE ?= "core-image-initramfs-boot"
-IMAGE_BOOT_FILES = "fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};fitImage boot.scr"
+IMAGE_BOOT_FILES = "\
+    fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};fitImage_a \
+    fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};fitImage_b \
+    boot.scr \
+"
 
 inherit core-image extrausers
 
@@ -33,10 +37,12 @@ EXTRA_USERS_PARAMS = " \
     usermod -G newgroup max; \
 "
 
-# GPT layout (A/B-ready): rootfs_a is the active RO root (PARTLABEL from
-# boot.scr); rootfs_b is reserved empty. /data is F2FS R/W (empty-f2fs WIC
-# plugin; fstab owned here — WIC has no --fstype=f2fs). Persist dropbear host
-# keys and (via volatile-binds OverlayFS) /var/lib,/var/log,/home on /data.
+# GPT A/B layout: rootfs_a/rootfs_b (RO), shared boot (fitImage_a/b + uboot.env),
+# /data F2FS R/W. Slot selected by U-Boot env bootslot; ab-update writes the
+# inactive slot from a local rootfs.ext4+fitImage bundle; ab-confirm clears
+# upgrade_available after a good boot (else U-Boot rolls back past bootlimit).
+# Persist dropbear host keys and (via volatile-binds OverlayFS)
+# /var/lib,/var/log,/home on /data.
 # Run after read_only_rootfs_hook (append, not +=) so fstab tweaks stick.
 ROOTFS_POSTPROCESS_COMMAND:append = " khepri_gpt_rootfs_layout;"
 khepri_gpt_rootfs_layout() {
@@ -48,6 +54,12 @@ khepri_gpt_rootfs_layout() {
     # WIC does not emit /data (non-/ mountpoint); install the real entry.
     sed -i '/[[:space:]]\/data[[:space:]]/d' ${IMAGE_ROOTFS}/etc/fstab
     printf 'LABEL=data\t/data\tf2fs\trelatime,discard\t0\t0\n' \
+        >> ${IMAGE_ROOTFS}/etc/fstab
+    # /boot for uboot.env / fitImage_* (WIC may also add this).
+    # LABEL=/PARTLABEL=boot are ambiguous when SD and eMMC both have the same
+    # GPT layout; ab-update/ab-confirm remount boot from the live root disk.
+    sed -i '/[[:space:]]\/boot[[:space:]]/d' ${IMAGE_ROOTFS}/etc/fstab
+    printf 'LABEL=boot\t/boot\tvfat\tdefaults\t0\t0\n' \
         >> ${IMAGE_ROOTFS}/etc/fstab
 
     # /var/log must be a real RO directory for data-var-log.service overlay.
