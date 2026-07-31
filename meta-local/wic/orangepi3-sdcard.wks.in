@@ -1,9 +1,10 @@
 # short-description: GPT SD/eMMC image for Orange Pi 3 (non-LTS)
 # long-description:
-# Custom GPT layout (partition names + filesystem labels):
-#   boot   (FAT/vfat)  — FIT image + boot.scr
-#   rootfs (ext4, R/O) — system root
-#   data   (F2FS, R/W) — persistent application data (fstab from image recipe)
+# Custom GPT layout (partition names + filesystem labels), A/B-ready:
+#   boot      (FAT/vfat)  — FIT image + boot.scr
+#   rootfs_a  (ext4, R/O) — active system root (slot A)
+#   rootfs_b  (ext4, R/O) — inactive slot B (empty until A/B switching)
+#   data      (F2FS, R/W) — persistent application data (fstab from image recipe)
 #
 # Allwinner BROM + GPT:
 #   A standard GPT entry array occupies LBA 2..33 and collides with the
@@ -14,18 +15,25 @@
 #
 # data uses source plugin empty-f2fs (WIC has no --fstype=f2fs). Mountpoint
 # is "data" (not /data) so WIC does not emit a wrong fstab fstype; the image
-# recipe adds LABEL=data with f2fs,relatime,discard. Size is 512 MiB because
-# F2FS overprovisioning is unreliable much below that.
+# recipe adds LABEL=data with f2fs,relatime,discard.
 #
-#  - -------------- --------------------------- ---------- ------------ ------
-# | | GPT (LBA0-33) | u-boot-sunxi-with-spl.bin |   boot   |   rootfs   | data |
-#  - -------------- --------------------------- ---------- ------------ ------
+# rootfs_b has no --source: WIC creates an empty labeled ext4. --no-fstab-update
+# keeps it out of /etc/fstab; boot still uses PARTLABEL=rootfs_a.
+#
+# SD image keeps data at 512 MiB (F2FS minimum / compact WIC). On eMMC clone,
+# sd-to-emmc grows the data partition to fill remaining space (~5800 MiB on
+# typical 8 GiB eMMC after boot + rootfs_a + rootfs_b).
+#
+#  - -------------- --------------------------- ---------- ------------ ------------ ------
+# | | GPT (LBA0-33) | u-boot-sunxi-with-spl.bin |   boot   |  rootfs_a  |  rootfs_b  | data |
+#  - -------------- --------------------------- ---------- ------------ ------------ ------
 # ^                 ^ 128KiB                    ^ 2MiB
 
 bootloader --ptable gpt
 
 part u-boot --source rawcopy --sourceparams="file=${SPL_BINARY}" --ondisk mmcblk0 --no-table --align 128
 part /boot --source bootimg-partition --ondisk mmcblk0 --fstype=vfat --label boot --part-name boot --align 2048 --fixed-size ${SUNXI_BOOT_SPACE} --use-label
-part / --source rootfs --ondisk mmcblk0 --fstype=ext4 --label rootfs --part-name rootfs --align 2048 --fixed-size 256 --use-label
+part / --source rootfs --ondisk mmcblk0 --fstype=ext4 --label rootfs_a --part-name rootfs_a --align 2048 --fixed-size 768 --use-label
+part rootfs_b --ondisk mmcblk0 --fstype=ext4 --label rootfs_b --part-name rootfs_b --align 2048 --fixed-size 768 --use-label --no-fstab-update
 # --fstype=ext4 selects Linux GPT type only; filesystem content is F2FS.
 part data --source empty-f2fs --ondisk mmcblk0 --fstype=ext4 --label data --part-name data --align 2048 --fixed-size 512

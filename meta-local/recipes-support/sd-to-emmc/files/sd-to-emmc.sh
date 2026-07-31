@@ -2,9 +2,9 @@
 # Clone Orange Pi 3 system from SD card to onboard eMMC and make it bootable.
 #
 # Matches meta-local GPT layout (orangepi3-sdcard.wks.in):
-#   LBA0 GPT | SPL+U-Boot @ 128 KiB | boot (FAT) | rootfs (ext4) | data (F2FS)
+#   LBA0 GPT | SPL+U-Boot @ 128 KiB | boot (FAT) | rootfs_a | rootfs_b | data (F2FS)
 #
-# Boot uses PARTLABEL=rootfs / part name "boot", so no bootargs rewrite is needed.
+# Boot uses PARTLABEL=rootfs_a / part name "boot", so no bootargs rewrite is needed.
 # Allwinner BROM loads SPL from the eMMC user area at 128 KiB (same as SD).
 #
 # Defaults match a board where Linux names SD=mmcblk2 and eMMC=mmcblk1.
@@ -23,7 +23,7 @@ usage() {
 	cat <<'EOF'
 Usage: sd-to-emmc [--yes] [--no-grow] [SRC DST]
 
-  Copy GPT + SPL/U-Boot + boot/rootfs/data from SD to eMMC.
+  Copy GPT + SPL/U-Boot + boot/rootfs_a/rootfs_b/data from SD to eMMC.
   Default: SRC=/dev/mmcblk2  DST=/dev/mmcblk1
 
   --yes       skip confirmation prompt
@@ -105,7 +105,7 @@ is_root_on() {
 	case "$root_src" in
 	"$1"|"$1"p*) return 0 ;;
 	esac
-	# PARTLABEL=rootfs resolves to a path under /dev/disk/by-partlabel
+	# PARTLABEL=rootfs_a resolves to a path under /dev/disk/by-partlabel
 	if [ -n "$root_src" ] && [ -e "$root_src" ]; then
 		real=$(readlink -f "$root_src" 2>/dev/null || printf '%s' "$root_src")
 		case "$real" in
