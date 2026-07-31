@@ -26,7 +26,7 @@ EXTRA_USERS_PARAMS = " \
 
 # GPT layout: /data is F2FS R/W (empty-f2fs WIC plugin; fstab owned here so
 # mount options are correct — WIC has no --fstype=f2fs). Persist dropbear
-# host keys and (via volatile-binds OverlayFS) /var/lib,/var/log there.
+# host keys and (via volatile-binds OverlayFS) /var/lib,/var/log,/home there.
 # Run after read_only_rootfs_hook (append, not +=) so fstab tweaks stick.
 ROOTFS_POSTPROCESS_COMMAND:append = " khepri_gpt_rootfs_layout;"
 khepri_gpt_rootfs_layout() {
