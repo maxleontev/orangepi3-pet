@@ -8,7 +8,6 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 SRC_URI = " \
     file://ab-update.sh \
     file://ab-confirm.sh \
-    file://ab-fixenv.sh \
     file://ab-confirm.service \
     file://fw_env.config \
 "
@@ -31,7 +30,6 @@ do_install() {
     install -d ${D}${sbindir}
     install -m 0755 ${WORKDIR}/ab-update.sh ${D}${sbindir}/ab-update
     install -m 0755 ${WORKDIR}/ab-confirm.sh ${D}${sbindir}/ab-confirm
-    install -m 0755 ${WORKDIR}/ab-fixenv.sh ${D}${sbindir}/ab-fixenv
 
     install -d ${D}${sysconfdir}
     install -m 0644 ${WORKDIR}/fw_env.config ${D}${sysconfdir}/fw_env.config

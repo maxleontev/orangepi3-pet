@@ -48,23 +48,6 @@ ab-confirm
 
 No positional arguments. Exits quietly if there is no pending upgrade.
 
-### On target: `ab-fixenv` (`/usr/sbin/ab-fixenv`)
-
-Repairs a sparse `/boot/uboot.env` that is missing `bootcmd` (U-Boot drops to
-the `=>` prompt). Re-seeds from `/etc/u-boot-initial-env` and preserves
-`bootslot` / upgrade flags when possible.
-
-```bash
-ab-fixenv
-```
-
-| Env | Default | Description |
-|-----|---------|-------------|
-| `FW_ENV_CONFIG` | `/etc/fw_env.config` | libubootenv config |
-| `BOOT_MNT` | `/boot` | Boot mountpoint |
-
-Must run as root. No positional arguments.
-
 ### On target: `sd-to-emmc` (`/usr/sbin/sd-to-emmc`)
 
 Clones the running SD GPT layout (SPL @ 128 KiB, boot / rootfs_a / rootfs_b /

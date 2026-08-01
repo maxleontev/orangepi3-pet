@@ -24,8 +24,13 @@ Apply on the board with `ab-update`.
 
 ## `push-ab-update.sh`
 
-Builds a bundle, uploads it over SSH as root, syncs the latest `ab-update`
-tools to `/data/update/tools/`, runs the update, and reboots the board.
+Builds a bundle, uploads it over SSH as root, runs `/usr/sbin/ab-update` on
+the board, waits for reboot, and verifies the new slot booted and was
+confirmed (`upgrade_available=0`, `bootcount=0`, slot switched). Prints one of:
+
+- `RESULT: PASS`
+- `RESULT: FAIL (SSH unreachable)` — board did not return within `SSH_WAIT_SEC`
+- `RESULT: FAIL (verification didn't pass)` — SSH up, but slot/confirm checks failed
 
 ```bash
 meta-local/scripts/push-ab-update.sh
@@ -37,12 +42,14 @@ No positional arguments. Override via environment:
 |-----|---------|-------------|
 | `TARGET` | `root@192.168.3.71` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
-| `REMOTE_DIR` | `/data/update` | Remote directory for bundle and tools |
+| `REMOTE_DIR` | `/data/update` | Remote directory for the bundle |
 | `BUNDLE_NAME` | `khepri-ab-update.tar.gz` | Bundle file name on the device |
+| `SSH_WAIT_SEC` | `300` | Max seconds to wait for SSH after reboot |
 
-SSH exit code `255` after reboot is treated as success (connection dropped).
+SSH exit code `255` from `ab-update` is treated as the expected reboot drop;
+final success still requires the post-reboot checks above.
 
-## `test-ab-update.sh`
+## `test-ab-update-scheme.sh`
 
 End-to-end A/B verification over SSH against a live board:
 
@@ -57,7 +64,7 @@ End-to-end A/B verification over SSH against a live board:
    never advances `bootcount`).
 
 ```bash
-meta-local/scripts/test-ab-update.sh
+meta-local/scripts/test-ab-update-scheme.sh
 ```
 
 Prints full snapshots (cmdline, PARTLABEL/PARTUUID, U-Boot env, `/boot`
@@ -68,7 +75,7 @@ after reflash).
 |-----|---------|-------------|
 | `TARGET` | `root@192.168.3.71` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Root private key |
-| `REMOTE_DIR` | `/data/update` | Remote directory for bundles/tools |
+| `REMOTE_DIR` | `/data/update` | Remote directory for bundles |
 | `DEPLOY` | `build-orangepi3/tmp/deploy/images/orange-pi-3` | Deploy dir for good/bad artifacts |
 | `SSH_WAIT_SEC` | `300` | Max seconds to wait for SSH after each reboot |
 | `SKIP_GOOD=1` | | Skip the good-bundle test |

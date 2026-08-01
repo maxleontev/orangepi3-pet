@@ -1,9 +1,10 @@
 #!/bin/bash
-# Build an A/B update bundle, copy it to the Orange Pi 3 over SSH, and run
-# ab-update (which switches the inactive slot and reboots by default).
+# Build an A/B update bundle, copy it to the Orange Pi 3 over SSH, run
+# ab-update, wait for reboot, and verify the new slot booted cleanly.
 #
 # Defaults match this project's root key and board address; override via env:
 #   TARGET=root@192.168.3.71  SSH_KEY=...  REMOTE_DIR=/data/update
+#   SSH_WAIT_SEC=300
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -13,63 +14,119 @@ TARGET="${TARGET:-root@192.168.3.71}"
 SSH_KEY="${SSH_KEY:-$ROOT/meta-local/recipes-core/root-ssh-keys/files/id_ed25519}"
 REMOTE_DIR="${REMOTE_DIR:-/data/update}"
 BUNDLE_NAME="${BUNDLE_NAME:-khepri-ab-update.tar.gz}"
+SSH_WAIT_SEC="${SSH_WAIT_SEC:-300}"
 
 SSH_OPTS=(
 	-i "$SSH_KEY"
 	-o IdentitiesOnly=yes
 	-o StrictHostKeyChecking=accept-new
 	-o BatchMode=yes
-	-o ConnectTimeout=15
+	-o ConnectTimeout=10
+	-o ServerAliveInterval=5
+	-o ServerAliveCountMax=2
 )
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s\n' "$*"; }
+
+ssh_try() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
+
+active_slot() {
+	ssh_try 'lsblk -no PARTLABEL "$(readlink -f "$(findmnt -n -o SOURCE /)")"'
+}
+
+wait_ssh_up() {
+	local label=$1
+	local start elapsed=0
+	start=$(date +%s)
+	log "==> Waiting for SSH ($label), max ${SSH_WAIT_SEC}s"
+	while true; do
+		elapsed=$(( $(date +%s) - start ))
+		if [ "$elapsed" -ge "$SSH_WAIT_SEC" ]; then
+			return 1
+		fi
+		if ssh_try 'test -r /etc/os-release' >/dev/null 2>&1; then
+			log "==> SSH up after ${elapsed}s ($label)"
+			return 0
+		fi
+		sleep 5
+	done
+}
 
 [ -f "$SSH_KEY" ] || die "SSH private key not found: $SSH_KEY"
 command -v ssh >/dev/null || die "ssh not found"
 command -v scp >/dev/null || die "scp not found"
 
+# Drop stale host key (common after reflash; harmless otherwise).
+host=${TARGET#*@}
+ssh-keygen -f "${HOME}/.ssh/known_hosts" -R "$host" >/dev/null 2>&1 || true
+
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 BUNDLE="$STAGE/$BUNDLE_NAME"
 
-echo "==> Building bundle"
+log "==> Building bundle"
 "$SCRIPT_DIR/make-ab-update-bundle.sh" "$BUNDLE"
 [ -f "$BUNDLE" ] || die "bundle was not created"
 
-echo "==> Checking SSH to $TARGET"
-ssh "${SSH_OPTS[@]}" "$TARGET" 'command -v ab-update >/dev/null' \
+log "==> Checking SSH to $TARGET"
+ssh_try 'command -v ab-update >/dev/null' \
 	|| die "ab-update not found on target (flash an image that includes ab-update)"
 
-# Deploy newest scripts under /data (rootfs is often read-only until reflash).
-AB_FILES="$ROOT/meta-local/recipes-support/ab-update/files"
-TOOLS_DIR="$REMOTE_DIR/tools"
-echo "==> Syncing ab-update tools to $TARGET:$TOOLS_DIR"
-ssh "${SSH_OPTS[@]}" "$TARGET" "mkdir -p '$TOOLS_DIR'"
-scp "${SSH_OPTS[@]}" \
-	"$AB_FILES/ab-update.sh" "$TARGET:$TOOLS_DIR/ab-update"
-scp "${SSH_OPTS[@]}" \
-	"$AB_FILES/ab-confirm.sh" "$TARGET:$TOOLS_DIR/ab-confirm"
-scp "${SSH_OPTS[@]}" \
-	"$AB_FILES/ab-fixenv.sh" "$TARGET:$TOOLS_DIR/ab-fixenv"
-ssh "${SSH_OPTS[@]}" "$TARGET" "chmod 755 '$TOOLS_DIR/ab-update' '$TOOLS_DIR/ab-confirm' '$TOOLS_DIR/ab-fixenv'"
+BEFORE=$(active_slot)
+log "==> Active slot before update: $BEFORE"
 
-echo "==> Uploading $(du -h "$BUNDLE" | cut -f1) to $TARGET:$REMOTE_DIR/"
-ssh "${SSH_OPTS[@]}" "$TARGET" "mkdir -p '$REMOTE_DIR'"
+log "==> Uploading $(du -h "$BUNDLE" | cut -f1) to $TARGET:$REMOTE_DIR/"
+ssh_try "mkdir -p '$REMOTE_DIR'"
 scp "${SSH_OPTS[@]}" "$BUNDLE" "$TARGET:$REMOTE_DIR/$BUNDLE_NAME"
 
-echo "==> Running ab-update (device will reboot)"
-# Connection drop on reboot is expected — do not treat as failure.
+log "==> Running ab-update (device will reboot)"
 set +e
-ssh "${SSH_OPTS[@]}" "$TARGET" \
-	"'$TOOLS_DIR/ab-update' --yes '$REMOTE_DIR/$BUNDLE_NAME'"
+out=$(ssh_try "ab-update --yes '$REMOTE_DIR/$BUNDLE_NAME'" 2>&1)
 rc=$?
 set -e
+printf '%s\n' "$out"
 
-# 0 = success before reboot; 255 = SSH dropped when the board rebooted.
-if [ "$rc" -eq 0 ] || [ "$rc" -eq 255 ]; then
-	echo "==> Update triggered (ssh exit $rc). Board should reboot into the new slot."
-	echo "    After boot, ab-confirm.service clears upgrade_available."
+# 0 = finished before reboot; 255 = SSH dropped when the board rebooted.
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 255 ]; then
+	die "ab-update via SSH failed (exit $rc)"
+fi
+log "==> ab-update triggered (ssh exit $rc)"
+
+if ! wait_ssh_up after-update; then
+	log "###### RESULT: FAIL (SSH unreachable) ######"
+	log "Board did not come back over SSH within ${SSH_WAIT_SEC}s after update."
+	log "Before slot was: $BEFORE — cannot verify whether the new slot booted."
+	exit 2
+fi
+
+AFTER=$(active_slot)
+ua=$(ssh_try 'fw_printenv -n upgrade_available' 2>/dev/null || echo NONE)
+bc=$(ssh_try 'fw_printenv -n bootcount' 2>/dev/null || echo NONE)
+bs=$(ssh_try 'fw_printenv -n bootslot' 2>/dev/null || echo NONE)
+
+log "==> After reboot: PARTLABEL=$AFTER bootslot=$bs upgrade_available=$ua bootcount=$bc"
+
+OK=1
+if [ "$AFTER" = "$BEFORE" ]; then
+	log "FAIL: slot did not switch (still $AFTER)"
+	OK=0
+fi
+if [ "$ua" != "0" ] || [ "$bc" != "0" ]; then
+	log "FAIL: expected upgrade_available=0 bootcount=0 (ab-confirm), got ua=$ua bc=$bc"
+	OK=0
+fi
+if ! ssh_try 'test -r /etc/os-release' >/dev/null 2>&1; then
+	log "FAIL: /etc/os-release not readable"
+	OK=0
+fi
+
+if [ "$OK" -eq 1 ]; then
+	log "###### RESULT: PASS ######"
+	log "Update OK: $BEFORE -> $AFTER (bootslot=$bs, confirmed)."
 	exit 0
 fi
 
-die "ab-update via SSH failed (exit $rc)"
+log "###### RESULT: FAIL (verification didn't pass) ######"
+log "Board is reachable over SSH, but update checks failed (see FAIL lines above)."
+exit 1
