@@ -1,7 +1,14 @@
 #!/bin/bash
+# Flash the latest deployed WIC image to a block device (default /dev/sda).
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
 IMAGE="core-image-khepri-orange-pi-3.rootfs"
-SRC="../build-orangepi3/tmp/deploy/images/orange-pi-3"
+SRC="${DEPLOY:-$ROOT/build-orangepi3/tmp/deploy/images/orange-pi-3}"
+DEST="${DEST:-/dev/sda}"
 WIC_GZ="${SRC}/${IMAGE}.wic.gz"
 WIC="${IMAGE}.wic"
 
@@ -13,9 +20,11 @@ fi
 WIC_GZ_REAL=$(readlink -f "${WIC_GZ}")
 echo "image: ${WIC_GZ_REAL}"
 echo "created: $(stat -c '%y' "${WIC_GZ_REAL}" | cut -d. -f1)"
+echo "dest: ${DEST}"
 
-echo "rm"
-rm -f "${WIC}" "${WIC}.gz"
+WORKDIR=$(mktemp -d)
+trap 'rm -rf "$WORKDIR"' EXIT
+cd "$WORKDIR"
 
 echo "cp"
 cp "${WIC_GZ}" .
@@ -24,13 +33,10 @@ echo "gunzip"
 gunzip -f "${IMAGE}.wic.gz"
 
 echo "dd"
-sudo dd if="${WIC}" of=/dev/sda bs=4M status=progress
+sudo dd if="${WIC}" of="${DEST}" bs=4M status=progress
 
 echo "sync"
 sync
-
-echo "rm"
-rm -f "${WIC}"
 
 echo "done"
 printf '\a'
