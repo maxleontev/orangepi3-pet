@@ -1,0 +1,10 @@
+#!/bin/bash
+# Wipe a block device with zeros (default /dev/sda). Destructive!
+
+set -euo pipefail
+
+DEST="${DEST:-/dev/sda}"
+echo "Zeroing ${DEST} — this destroys all data on the device"
+sudo dd if=/dev/zero of="${DEST}" bs=4M status=progress oflag=sync
+sync
+echo "done"

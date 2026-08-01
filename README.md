@@ -6,58 +6,11 @@ distribution for the **Orange Pi 3** single-board computer (image
 
 ## Scripts
 
-Host-side helpers live under `meta-local/scripts/` and `scripts/`.
+Host-side helpers live under [`meta-local/scripts/`](meta-local/scripts/) —
+see [`meta-local/scripts/README.md`](meta-local/scripts/README.md).
+
 On-target tools are installed into the image as `/usr/sbin/*` from
 `meta-local/recipes-support/`.
-
-### Host: `meta-local/scripts/make-ab-update-bundle.sh`
-
-Packs a local A/B update bundle (`rootfs.ext4` + `fitImage`) from the Yocto
-deploy directory.
-
-```bash
-meta-local/scripts/make-ab-update-bundle.sh [OUT.tar.gz]
-```
-
-| Argument / env | Default | Description |
-|----------------|---------|-------------|
-| `OUT` (optional positional) | `$PWD/khepri-ab-update.tar.gz` | Output archive path |
-| `DEPLOY` | `build-orangepi3/tmp/deploy/images/orange-pi-3` | Deploy directory with `.ext4` and FIT |
-
-Apply on the board with `ab-update` (see below).
-
-### Host: `meta-local/scripts/push-ab-update.sh`
-
-Builds a bundle, uploads it over SSH as root, syncs the latest `ab-update`
-tools to `/data/update/tools/`, runs the update, and reboots the board.
-
-```bash
-meta-local/scripts/push-ab-update.sh
-```
-
-No positional arguments. Override via environment:
-
-| Env | Default | Description |
-|-----|---------|-------------|
-| `TARGET` | `root@192.168.3.71` | SSH target |
-| `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
-| `REMOTE_DIR` | `/data/update` | Remote directory for bundle and tools |
-| `BUNDLE_NAME` | `khepri-ab-update.tar.gz` | Bundle file name on the device |
-
-SSH exit code `255` after reboot is treated as success (connection dropped).
-
-### Host: `scripts/cp_d`
-
-Flashes the latest deployed `.wic.gz` to a block device (default `/dev/sda`).
-
-```bash
-cd scripts && ./cp_d
-```
-
-Uses image
-`build-orangepi3/tmp/deploy/images/orange-pi-3/core-image-khepri-orange-pi-3.rootfs.wic.gz`.
-Requires `sudo` for `dd`. No CLI flags — edit the script to change the target
-device or image name.
 
 ### On target: `ab-update` (`/usr/sbin/ab-update`)
 

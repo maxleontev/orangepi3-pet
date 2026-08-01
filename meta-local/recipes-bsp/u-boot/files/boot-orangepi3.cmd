@@ -15,6 +15,9 @@
 #   bootcount          — increments each boot while upgrade_available=1
 #   bootlimit          — rollback after this many unconfirmed boots (default 3)
 #
+# If load/bootm of the slot FIT fails while upgrade_available=1, the script
+# resets so bootcount can reach bootlimit (corrupt FIT never reaches Linux).
+#
 # SPL+U-Boot live at 128 KiB. Load FIT at kernel_comp_addr_r so gzip
 # decompress does not overwrite the FIT.
 
@@ -29,7 +32,9 @@ if test -z "${bootlimit}"; then setenv bootlimit 3; fi
 if test "${upgrade_available}" = "1"; then
 	setexpr bootcount ${bootcount} + 1
 	saveenv
-	if test ${bootcount} -gt ${bootlimit}; then
+	echo "A/B: upgrade pending, bootcount=${bootcount}/${bootlimit}"
+	# itest: integer compare (test -gt is unreliable across U-Boot builds)
+	if itest ${bootcount} > ${bootlimit}; then
 		echo "A/B: bootlimit exceeded, rolling back from slot ${bootslot}"
 		if test "${bootslot}" = "a"; then
 			setenv bootslot b
@@ -58,5 +63,16 @@ part uuid mmc ${devnum}:${rootpart} rootuuid
 setenv bootargs console=${console} console=tty1 root=PARTUUID=${rootuuid} rootfstype=ext4 ro rootflags=noatime rootwait panic=10 ${extra}
 
 echo "A/B: booting slot ${bootslot} (${fitfile}, ${root_partname} PARTUUID=${rootuuid} on mmc ${devnum})"
-load mmc ${devnum}:${bootpart} ${kernel_comp_addr_r} ${fitfile}
-bootm ${kernel_comp_addr_r}
+if load mmc ${devnum}:${bootpart} ${kernel_comp_addr_r} ${fitfile}; then
+	bootm ${kernel_comp_addr_r}
+fi
+# bootm returns only on failure (wrong format, bad FIT, etc.). Without reset,
+# distro bootcmd runs and eventually drops to the U-Boot prompt — bootcount
+# never advances and A/B rollback never triggers. Reboot while an upgrade is
+# still pending so bootlimit can roll back to the previous slot.
+echo "A/B: boot failed for ${fitfile} (slot ${bootslot})"
+if test "${upgrade_available}" = "1"; then
+	echo "A/B: resetting to advance bootcount / rollback"
+	reset
+fi
+echo "A/B: no pending upgrade — not resetting (recover from U-Boot prompt)"
