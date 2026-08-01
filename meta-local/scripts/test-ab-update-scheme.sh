@@ -21,7 +21,6 @@ SKIP_GOOD="${SKIP_GOOD:-0}"
 SKIP_BAD_ROOTFS="${SKIP_BAD_ROOTFS:-0}"
 SKIP_BAD_FIT="${SKIP_BAD_FIT:-0}"
 
-TOOLS_SRC="$ROOT/meta-local/recipes-support/ab-update/files"
 MAKE_BUNDLE="$ROOT/meta-local/scripts/make-ab-update-bundle.sh"
 
 SSH=(ssh -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
@@ -32,7 +31,7 @@ SCP=(scp -i "$SSH_KEY" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new
 
 usage() {
 	cat <<'EOF'
-Usage: test-ab-update.sh
+Usage: test-ab-update-scheme.sh
 
   Run good, bad-rootfs, and bad-FIT A/B tests over SSH.
 
@@ -118,8 +117,10 @@ echo --- lsblk ---
 lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,PARTLABEL,MOUNTPOINT
 echo --- boot artifacts ---
 ls -lh /boot/boot.scr /boot/fitImage_a /boot/fitImage_b /boot/uboot.env 2>&1
-echo --- boot.scr markers ---
-strings /boot/boot.scr | grep -E "bootcount=|itest|bootlimit|fitImage_|PARTUUID|rolling|resetting to advance|boot failed for" || true
+echo --- boot.scr feature check (strings from /boot/boot.scr; noise is normal) ---
+echo "(looking for: bootcount/bootlimit, PARTUUID, fitImage_*, reset-on-bootm-fail)"
+strings /boot/boot.scr | grep -E "bootcount=|itest|bootlimit|fitImage_|PARTUUID|rolling|resetting to advance|boot failed for" || echo "(no expected markers found — boot.scr may be outdated)"
+echo --- end boot.scr feature check ---
 echo --- os-release ---
 sed -n "1,2p" /etc/os-release'
 }
@@ -132,22 +133,17 @@ resolve_fit() {
 	printf '%s\n' "$fit"
 }
 
-sync_tools() {
-	ssh_try "mkdir -p '$REMOTE_DIR/tools'" >/dev/null
-	"${SCP[@]}" "$TOOLS_SRC/ab-update.sh" "$TARGET:$REMOTE_DIR/tools/ab-update"
-	ssh_try "chmod 755 '$REMOTE_DIR/tools/ab-update'" >/dev/null
-}
-
 run_ab_update_remote() {
 	local bundle_local=$1 bundle_name=$2
 	local remote_path="$REMOTE_DIR/$bundle_name"
 	log "===== UPLOAD $bundle_local -> $remote_path ====="
-	sync_tools
+	ssh_try "command -v ab-update >/dev/null" || die "ab-update not found on target"
+	ssh_try "mkdir -p '$REMOTE_DIR'" >/dev/null
 	"${SCP[@]}" "$bundle_local" "$TARGET:$remote_path"
-	ssh_try "ls -lh '$remote_path' '$REMOTE_DIR/tools/ab-update'"
+	ssh_try "ls -lh '$remote_path'"
 	log "===== RUN ab-update --yes ====="
 	set +e
-	out=$(ssh_try "'$REMOTE_DIR/tools/ab-update' --yes '$remote_path'")
+	out=$(ssh_try "ab-update --yes '$remote_path'")
 	rc=$?
 	set -e
 	printf '%s\n' "$out"
