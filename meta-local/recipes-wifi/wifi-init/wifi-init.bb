@@ -3,19 +3,24 @@ LICENSE = "CLOSED"
 
 SRC_URI = " \
     file://wifi.service \
+    file://wifi-roam.service \
+    file://wifi-connect.sh \
+    file://wifi-roam.sh \
 "
 
-do_install() {
-    # Устанавливаем systemd-юнит
-    install -d ${D}${systemd_unitdir}/system
-    install -m 0644 ${WORKDIR}/wifi.service ${D}${systemd_unitdir}/system/
-}
-
-# Наследуем systemd для автоматической обработки юнитов
 inherit systemd
 
-# Указываем, какой сервис мы предоставляем
-SYSTEMD_SERVICE:${PN} = "wifi.service"
+do_install() {
+    install -d ${D}${systemd_system_unitdir}
+    install -m 0644 ${WORKDIR}/wifi.service ${D}${systemd_system_unitdir}/
+    install -m 0644 ${WORKDIR}/wifi-roam.service ${D}${systemd_system_unitdir}/
 
-# Включаем сервис при старте (по умолчанию)
+    install -d ${D}${sbindir}
+    install -m 0755 ${WORKDIR}/wifi-connect.sh ${D}${sbindir}/wifi-connect
+    install -m 0755 ${WORKDIR}/wifi-roam.sh ${D}${sbindir}/wifi-roam
+}
+
+SYSTEMD_SERVICE:${PN} = "wifi.service wifi-roam.service"
 SYSTEMD_AUTO_ENABLE = "enable"
+
+RDEPENDS:${PN} += "wpa-supplicant iw"
