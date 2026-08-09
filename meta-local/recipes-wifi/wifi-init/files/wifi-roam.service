@@ -1,12 +1,11 @@
-# Band preference companion for wifi.service (see /usr/sbin/wifi-roam).
+# Band selection companion for wifi.service (see /usr/sbin/wifi-roam).
 #
-# priority= in wpa_supplicant.conf selects 5G on first association, but does
-# not leave an already-established weak 5G link for 2.4. This unit performs
-# RSSI failover with hysteresis. PartOf=wifi.service — shared lifecycle with
-# connect.
+# Compares measured RSSI across all wpa_supplicant network{} blocks and
+# switches when another SSID is stronger by MARGIN_DB. PartOf=wifi.service —
+# shared lifecycle with connect.
 
 [Unit]
-Description=WiFi band preference (prefer 5G, fallback to 2.4 on weak RSSI)
+Description=WiFi network selection by signal strength
 Documentation=file:///etc/wpa_supplicant.conf
 After=wifi.service
 Requires=wifi.service

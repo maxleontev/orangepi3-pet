@@ -1,7 +1,8 @@
 SUMMARY = "Khepri image for Orange Pi 3 with WiFi and local user setup"
-DESCRIPTION = "Console image based on core-image-base, plus AP6256 WiFi \
-support, Midnight Commander, and a preconfigured local user. Boots via a \
-FIT image (kernel + DTB + minimal initramfs)."
+DESCRIPTION = "Image based on core-image-base, plus AP6256 WiFi, Midnight \
+Commander, a preconfigured local user, and an HDMI Wayland/Weston info panel \
+(CPU temperature, memory, IP) using Mesa Lima. Boots via a FIT image \
+(kernel + DTB + minimal initramfs)."
 LICENSE = "MIT"
 
 # read-only-rootfs: fstab/cmdline tweaks + dropbear key dir defaults (we
@@ -9,6 +10,8 @@ LICENSE = "MIT"
 IMAGE_FEATURES += "splash read-only-rootfs"
 
 IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc sd-to-emmc root-ssh-keys ab-update"
+IMAGE_INSTALL:append = " weston weston-init info-panel kmscube display-rf-blacklist"
+
 
 # Must match INITRAMFS_IMAGE in linux-mainline bbappend (kernel recipe scope).
 # Deployed FIT with ramdisk is named fitImage-${INITRAMFS_IMAGE_NAME}-${MACHINE};
