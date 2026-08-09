@@ -1,0 +1,15 @@
+#!/bin/sh
+
+#check current slot:
+
+fw_printenv -n bootslot
+lsblk -no PARTLABEL "$(readlink -f "$(findmnt -n -o SOURCE /)")"
+
+#switch to another slotт (example: a  → b):
+
+fw_setenv bootslot b
+fw_setenv upgrade_available 0
+fw_setenv bootcount 0
+reboot
+
+
