@@ -1,89 +1,54 @@
 #!/bin/sh
 # =============================================================================
-# wifi-roam — prefer 5 GHz, fall back to 2.4 when RSSI is weak
+# wifi-roam — pick the strongest configured WiFi network by measured RSSI
 # =============================================================================
 #
 # Why a separate daemon instead of only priority= in wpa_supplicant.conf
 # ----------------------------------------------------------------------
-# In conf:
-#   Chuck Norris_5G  priority=20
-#   Chuck Norris     priority=10
-#   bgscan="simple:30:-70:300"
-#
-# priority picks well on *first* association (if 5G is visible, take it). But
-# stock wpa_supplicant will NOT leave an already-COMPLETED BSS for another SSID
-# just because RSSI is poor: "weak but still holding" on 5G stays put even when
-# 2.4 next door is louder and more stable.
-#
-# Desired product behaviour:
-#   - prefer Chuck Norris_5G when it is good enough;
-#   - on weak 5G, force Chuck Norris (2.4);
-#   - return to 5G only when a scan again shows an acceptable level
-#     (hysteresis, no 5G↔2.4 flap).
+# priority= helps the *first* association. Stock wpa_supplicant will not leave
+# an already-COMPLETED BSS for another configured SSID just because that one
+# is louder in scan. This daemon periodically compares real levels across
+# every network block in wpa_supplicant and switches when another is
+# meaningfully stronger.
 #
 # Scheme
 # ------
-# After wifi.service (PartOf/After), loop forever:
-#   - on 5G and RSSI <= RSSI_BAD  → select_network(2.4);
-#   - on 2.4 and scan(5G) >= RSSI_GOOD → select_network(5G).
+# Every INTERVAL_SEC (while wpa_state=COMPLETED):
+#   1) trigger a scan and wait briefly for results;
+#   2) for each configured network (wpa_cli list_networks), take best scan
+#      RSSI for its SSID;
+#   3) for the *current* SSID prefer signal_poll AVG_RSSI/RSSI when available;
+#   4) if another network beats the current one by at least MARGIN_DB →
+#      select_network(that id).
 #
-# select_network disables other network{} blocks — intentional:
-# if after falling back to 2.4 we enable_network all again while priority=20
-# is live, wpa immediately pulls back onto weak 5G and flaps. While we sit on
-# the fallback band, 5G stays disabled until a scan confirms RSSI_GOOD.
+# select_network disables other network{} blocks on purpose so wpa priority
+# cannot yank us back before the next compare cycle. After a failed switch,
+# enable_network all restores all candidates.
 #
-# Problems this closes
-# --------------------
-# 1. "Two networks in conf, but always 2.4"
-#    Early wifi-connect used select_network 0 while 2.4 was network id 0 —
-#    5G was effectively disabled during connect and after. Connect no longer
-#    pins an id; boot uses priority, then this daemon.
+# MARGIN_DB hysteresis avoids flapping when levels are within a few dB.
+# On a tie (difference < margin), stay on the current association.
 #
-# 2. "priority is set — why stay on weak 5G?"
-#    wpa_supplicant limit: priority ≠ RSSI roaming across different SSIDs.
-#    On the board after boot we saw 5G at RSSI≈-77; this script moved to 2.4
-#    (bad=-75); 5G scan -77 < good=-68 — do not return yet.
-#
-# 3. Band flapping
-#    Split bad/good thresholds (default -75 / -68) and INTERVAL_SEC.
-#    Switch only from COMPLETED; ignore SCANNING/DISCONNECT.
-#
-# 4. Address loss after BSS change
-#    After a successful switch — short udhcpc (same L2/LAN often keeps the
-#    address, but lease/routes may be stale).
-#
-# 5. Failed switch
-#    If COMPLETED never arrives — enable_network all so we do not remain with
-#    one disabled set and endless SCANNING.
-#
-# 6. Dependency on wifi-connect
-#    Wait until both network ids appear in list_networks (wpa already on our
-#    conf). Unit: After/Requires/PartOf=wifi.service — stopping wifi stops roam.
-#
-# 7. RF/HDMI context (see wifi-connect)
-#    2.4 drop after DRM load is an image-level story. Roam does not fix RF, but
-#    on 5G RSSI degradation it gives a predictable fallback to 2.4.
-#
-# Env: IFACE, SSID_5G, SSID_24, RSSI_BAD, RSSI_GOOD, INTERVAL_SEC
-# Thresholds are dBm (more negative = weaker). Example: bad=-75, good=-68.
+# Env: IFACE, MARGIN_DB, INTERVAL_SEC, SCAN_WAIT_SEC
 # =============================================================================
 set -eu
 
 IFACE="${IFACE:-wlan0}"
-SSID_5G="${SSID_5G:-Chuck Norris_5G}"
-SSID_24="${SSID_24:-Chuck Norris}"
-# Leave 5G when current RSSI is at or below this threshold.
-RSSI_BAD="${RSSI_BAD:--75}"
-# Return to 5G only when scan_results level is at least this good.
-RSSI_GOOD="${RSSI_GOOD:--68}"
+# Switch only if another network is at least this many dB stronger.
+MARGIN_DB="${MARGIN_DB:-6}"
 INTERVAL_SEC="${INTERVAL_SEC:-20}"
+SCAN_WAIT_SEC="${SCAN_WAIT_SEC:-4}"
 
 log() { printf 'wifi-roam: %s\n' "$*"; }
 
-nid_by_ssid() {
-	# list_networks: id \t ssid \t ... — SSID may contain spaces (Chuck Norris).
-	wpa_cli -i "$IFACE" list_networks 2>/dev/null \
-		| awk -F '\t' -v s="$1" 'NR > 1 && $2 == s { print $1; exit }'
+# Configured networks: "id<TAB>ssid" (ssid may contain spaces).
+list_nets() {
+	wpa_cli -i "$IFACE" list_networks 2>/dev/null | awk -F '\t' '
+		NR > 1 && $2 != "" { print $1 "\t" $2 }
+	'
+}
+
+net_count() {
+	list_nets | wc -l | tr -d ' \t'
 }
 
 cur_ssid() {
@@ -134,57 +99,84 @@ switch_to() {
 	nid=$1
 	label=$2
 	[ -n "$nid" ] || return 1
-	log "switching to $label (network $nid)"
+	log "switching to '$label' (network $nid)"
 	wpa_cli -i "$IFACE" select_network "$nid" >/dev/null 2>&1 || return 1
 	if wait_completed; then
 		udhcpc -i "$IFACE" -n -q -t 5 -T 2 >/dev/null 2>&1 || true
-		log "associated to $label"
+		log "associated to '$label'"
 		return 0
 	fi
-	log "switch to $label failed; re-enabling all networks"
+	log "switch to '$label' failed; re-enabling all networks"
 	wpa_cli -i "$IFACE" enable_network all >/dev/null 2>&1 || true
 	return 1
 }
 
-NID_5G=
-NID_24=
-while [ -z "$NID_5G" ] || [ -z "$NID_24" ]; do
-	NID_5G=$(nid_by_ssid "$SSID_5G" || true)
-	NID_24=$(nid_by_ssid "$SSID_24" || true)
-	if [ -n "$NID_5G" ] && [ -n "$NID_24" ]; then
+# Return 0 if $1 is stronger than $2 by at least MARGIN_DB (dBm; higher = better).
+stronger_by_margin() {
+	cand=$1
+	cur=$2
+	[ -n "$cand" ] && [ -n "$cur" ] || return 1
+	[ "$((cand - cur))" -ge "$MARGIN_DB" ]
+}
+
+while true; do
+	n=$(net_count || echo 0)
+	if [ "$n" -ge 1 ]; then
 		break
 	fi
-	log "waiting for wpa networks ($SSID_5G=$NID_5G $SSID_24=$NID_24)"
+	log "waiting for configured wpa networks"
 	sleep 3
 done
-log "ready: 5G=id$NID_5G 2.4=id$NID_24 thresholds bad=$RSSI_BAD good=$RSSI_GOOD"
+log "ready: $(net_count) configured network(s), margin=${MARGIN_DB}dB interval=${INTERVAL_SEC}s"
 
 while true; do
 	sleep "$INTERVAL_SEC"
 	st=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n 's/^wpa_state=//p' | tr -d '\r' || true)
 	[ "$st" = "COMPLETED" ] || continue
 
-	ssid=$(cur_ssid || true)
-	rssi=$(cur_rssi || true)
+	cur=$(cur_ssid || true)
+	[ -n "$cur" ] || continue
 
-	case "$ssid" in
-		"$SSID_5G")
-			if [ -n "$rssi" ] && [ "$rssi" -le "$RSSI_BAD" ]; then
-				log "5G weak (RSSI=$rssi <= $RSSI_BAD) -> 2.4"
-				switch_to "$NID_24" "$SSID_24" || true
-			fi
-			;;
-		"$SSID_24")
-			# On fallback band 5G is disabled (select_network) — judge air via scan.
-			wpa_cli -i "$IFACE" scan >/dev/null 2>&1 || true
-			sleep 4
-			lvl=$(scan_level "$SSID_5G" || true)
-			if [ -n "$lvl" ] && [ "$lvl" -ge "$RSSI_GOOD" ]; then
-				log "5G recovered (scan=$lvl >= $RSSI_GOOD) -> 5G"
-				switch_to "$NID_5G" "$SSID_5G" || true
-			fi
-			;;
-		*)
-			;;
-	esac
+	wpa_cli -i "$IFACE" scan >/dev/null 2>&1 || true
+	sleep "$SCAN_WAIT_SEC"
+
+	assoc=$(cur_rssi || true)
+	best_id=
+	best_ssid=
+	best_lvl=
+	cur_lvl=
+	levels=
+
+	# IFS=tab so SSID may contain spaces.
+	while IFS="$(printf '\t')" read -r id ssid; do
+		[ -n "$id" ] && [ -n "$ssid" ] || continue
+		lvl=$(scan_level "$ssid" || true)
+		if [ "$ssid" = "$cur" ] && [ -n "$assoc" ]; then
+			lvl=$assoc
+		fi
+		[ -n "$lvl" ] || continue
+
+		levels="${levels}${levels:+ }'${ssid}'=${lvl}dBm"
+		if [ "$ssid" = "$cur" ]; then
+			cur_lvl=$lvl
+		fi
+		if [ -z "$best_lvl" ] || [ "$lvl" -gt "$best_lvl" ]; then
+			best_lvl=$lvl
+			best_id=$id
+			best_ssid=$ssid
+		fi
+	done <<EOF
+$(list_nets)
+EOF
+
+	log "levels:${levels:- none} current='$cur'"
+
+	[ -n "$best_id" ] && [ -n "$best_lvl" ] || continue
+	[ -n "$cur_lvl" ] || continue
+	[ "$best_ssid" != "$cur" ] || continue
+
+	if stronger_by_margin "$best_lvl" "$cur_lvl"; then
+		log "'$best_ssid' stronger ($best_lvl vs $cur_lvl, margin=${MARGIN_DB}) -> switch"
+		switch_to "$best_id" "$best_ssid" || true
+	fi
 done

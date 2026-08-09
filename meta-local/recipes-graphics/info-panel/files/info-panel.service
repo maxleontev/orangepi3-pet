@@ -1,0 +1,22 @@
+[Unit]
+Description=HDMI real-time system info panel
+After=weston.service
+BindsTo=weston.service
+PartOf=weston.service
+
+[Service]
+Type=simple
+User=weston
+Group=weston
+SupplementaryGroups=wayland
+Environment=XDG_RUNTIME_DIR=/run
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/bin/sh -c 'i=0; while [ ! -S /run/wayland-0 ] && [ $i -lt 50 ]; do i=$((i+1)); sleep 0.2; done; [ -S /run/wayland-0 ]'
+ExecStart=/usr/bin/info-panel
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=weston.service

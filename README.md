@@ -77,3 +77,22 @@ lsblk -no PARTLABEL "$(findmnt -n -o SOURCE / | xargs -r readlink -f)"
 # or
 fw_printenv -n bootslot
 ```
+
+## Build & flash
+
+`local.conf` must include the graphics distro fragment:
+
+```bash
+# build-orangepi3/conf/local.conf
+require conf/distro/include/orangepi3-graphics.inc
+```
+
+Then build and push an A/B update over SSH:
+
+```bash
+bitbake core-image-khepri
+SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # if dual-NIC host
+```
+
+Expect a larger rootfs than a WiFi-only image (Weston, Mesa, fonts, DRM modules).
+HDMI stack details: [`meta-local/recipes-graphics/README.md`](meta-local/recipes-graphics/README.md).

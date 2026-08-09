@@ -12,6 +12,9 @@ KERNEL_IMAGETYPES:append:orange-pi-3 = " fitImage"
 # F2FS for the GPT data partition (LABEL=data).
 SRC_URI:append:orange-pi-3 = " file://f2fs.cfg"
 
+# files/drm.cfg overrides meta-sunxi's fragment (same file://drm.cfg name)
+# when MACHINEOVERRIDES includes use-mailine-graphics.
+
 # Small initramfs that mounts root= and switch_root's — NOT the live/installer
 # image (core-image-minimal-initramfs), which mounts partitions R/W first and
 # then fails with "Can't mount, would change RO state" when root is requested ro.
