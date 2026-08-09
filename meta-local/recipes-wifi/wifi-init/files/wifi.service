@@ -1,19 +1,35 @@
+# WiFi connection for Orange Pi 3 (AP6256 / brcmfmac).
+#
+# Why oneshot + /usr/sbin/wifi-connect instead of several ExecStartPre lines:
+# the old unit marked the service successful right after starting
+# wpa_supplicant/udhcpc without checking COMPLETED → active while
+# operstate=down and a stale IPv4. The script waits for association; on
+# failure exit≠0 and Restart=on-failure retries (typical after reboot: late
+# firmware, scan glitch, brief AP outage).
+#
+# Do NOT use ConditionPathExists on wlan0: the netdev appears asynchronously
+# after SDIO/firmware; the condition permanently skips the unit.
+# After=...wlan0.device is a soft ordering hint, not a substitute for the
+# wait loop in the script.
+#
+# ExecStop cleans wpa/udhcpc and brings the link down; wifi-roam is tied via
+# PartOf and stops with this unit.
+
 [Unit]
-Description=WiFi connection
+Description=WiFi connection (brcmfmac / AP6256)
+Documentation=file:///etc/wpa_supplicant.conf
 Wants=network.target
-After=network.target systemd-modules-load.service
-# Do not use ConditionPathExists here — wlan0 appears asynchronously
-# after brcmfmac firmware load; ExecStartPre waits for it instead.
+After=network.target systemd-modules-load.service sys-subsystem-net-devices-wlan0.device
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Retry until wlan0 appears (SDIO + firmware can take a few seconds)
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -d /sys/class/net/wlan0 ] && exit 0; sleep 1; done; echo "wlan0 not found"; exit 1'
-ExecStartPre=/sbin/ip link set wlan0 up
-ExecStartPre=/usr/sbin/wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf
-ExecStart=/sbin/udhcpc -i wlan0 -b
-ExecStop=/usr/bin/killall wpa_supplicant udhcpc
+ExecStart=/usr/sbin/wifi-connect
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=0
+TimeoutStartSec=120
+ExecStop=/bin/sh -c 'killall udhcpc 2>/dev/null || true; if [ -f /run/wpa_supplicant-wlan0.pid ]; then kill "$(cat /run/wpa_supplicant-wlan0.pid)" 2>/dev/null || true; fi; killall wpa_supplicant 2>/dev/null || true; ip link set wlan0 down 2>/dev/null || true'
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+# Kiosk Weston on Orange Pi 3: wait for late sun4i-drm HDMI probe, bind the
+# HDMI KMS card (not a render-only GPU node), prefer Mesa Lima.
+
+[Unit]
+Description=Weston, a Wayland compositor, as a system service
+Documentation=man:weston(1) man:weston.ini(5)
+Documentation=http://wayland.freedesktop.org/
+
+Requires=systemd-user-sessions.service
+After=systemd-user-sessions.service
+After=plymouth-quit-wait.service
+After=systemd-modules-load.service
+# Associate WiFi before bringing up HDMI/GPU (RF coexistence on Orange Pi 3).
+After=wifi.service
+Wants=wifi.service
+
+Wants=dbus.socket
+After=dbus.socket
+
+Requires=weston.socket
+Before=graphical.target
+
+ConditionPathExists=/dev/tty0
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/default/weston
+Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
+# "+" = run as root despite User=weston (modprobe + /dev/dri + /run write).
+# weston-prepare-drm loads blacklisted HDMI modules and waits for card nodes.
+ExecStartPre=+/usr/libexec/weston-prepare-drm.sh
+ExecStart=/bin/sh -c 'exec /usr/bin/weston --modules=systemd-notify.so --drm-device="$(cat /run/weston-drm-device)"'
+TimeoutStartSec=120
+Restart=on-failure
+RestartSec=3
+
+User=weston
+Group=weston
+WorkingDirectory=/home/weston
+PAMName=weston-autologin
+
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+
+UtmpIdentifier=tty7
+UtmpMode=user
+
+[Install]
+WantedBy=multi-user.target

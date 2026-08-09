@@ -1,0 +1,21 @@
+# Band selection companion for wifi.service (see /usr/sbin/wifi-roam).
+#
+# Compares measured RSSI across all wpa_supplicant network{} blocks and
+# switches when another SSID is stronger by MARGIN_DB. PartOf=wifi.service —
+# shared lifecycle with connect.
+
+[Unit]
+Description=WiFi network selection by signal strength
+Documentation=file:///etc/wpa_supplicant.conf
+After=wifi.service
+Requires=wifi.service
+PartOf=wifi.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wifi-roam
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
