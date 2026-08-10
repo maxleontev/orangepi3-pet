@@ -1,0 +1,17 @@
+#!/bin/sh
+# JSON list of scanned SSIDs for the setup UI.
+set -eu
+
+echo "Content-Type: application/json; charset=utf-8"
+echo "Cache-Control: no-store"
+echo ""
+
+# Refresh when ?refresh=1 (or any query); otherwise serve cache quickly.
+case "${QUERY_STRING:-}" in
+	*refresh=1*|*refresh=true*)
+		/usr/sbin/wifi-scan --json 2>/dev/null || printf '[]\n'
+		;;
+	*)
+		/usr/sbin/wifi-scan --cache-only --json 2>/dev/null || printf '[]\n'
+		;;
+esac

@@ -41,11 +41,11 @@
 #    sees the SSID at all).
 #
 # 4. Stuck in SCANNING while the AP is visible
-#    Observed: Chuck Norris present in scan_results, but association never
+#    Observed: target BSS present in scan_results, but association never
 #    completes. Periodically: enable_network all + reassociate + scan. Do NOT
 #    use select_network N — that disables other network{} blocks (broke 5 GHz
-#    preference and wifi-roam; earlier select_network 0 hard-pinned only the
-#    2.4 GHz "Chuck Norris" network).
+#    preference and wifi-roam; earlier select_network 0 hard-pinned a single
+#    2.4 GHz network{} entry).
 #
 # 5. AP6256 powersave
 #    With PS enabled, association / link hold is less reliable on this combo;
@@ -64,20 +64,60 @@
 #    unit with a stale IP.
 #
 # 8. Dual SSID (2.4 + 5 GHz) and band selection
-#    SSID list lives in /data/wpa_supplicant.conf. Ongoing choice by measured
+#    SSID list lives in /data/wifi.conf. Ongoing choice by measured
 #    RSSI is wifi-roam (wpa priority alone will not leave a weaker COMPLETED
 #    BSS for a louder one on the other band).
 #
-# Optional env: IFACE, CONF, WAIT_IFACE_SEC, WAIT_ASSOC_SEC
+# 9. Setup AP fallback
+#    If no networks are configured, or STA association/DHCP fails, start an
+#    open setup AP (hostapd + dnsmasq + web UI) via wifi-ap-start. User
+#    configures /data/wifi.conf in the browser; wifi.service restart
+#    switches back to STA. AP mode writes /run/wifi-mode=ap and exits 0 so
+#    Weston and other After=wifi.service units can proceed.
+#
+# Optional env: IFACE, CONF, WAIT_IFACE_SEC, WAIT_ASSOC_SEC, AP_FALLBACK
 # =============================================================================
 set -eu
 
 IFACE="${IFACE:-wlan0}"
-CONF="${CONF:-/data/wpa_supplicant.conf}"
+CONF="${CONF:-/data/wifi.conf}"
 WAIT_IFACE_SEC="${WAIT_IFACE_SEC:-30}"
 WAIT_ASSOC_SEC="${WAIT_ASSOC_SEC:-60}"
+AP_FALLBACK="${AP_FALLBACK:-1}"
 
-log() { printf 'wifi-connect: %s\n' "$*"; }
+log() { printf 'wifi-connect: %s\n' "$*" >&2; }
+
+migrate_legacy_conf() {
+	# One-shot rename from older layout; drop ephemeral AP configs from /data.
+	if [ ! -f "$CONF" ] && [ -f /data/wpa_supplicant.conf ]; then
+		mv -f /data/wpa_supplicant.conf "$CONF"
+		log "migrated /data/wpa_supplicant.conf -> $CONF"
+	fi
+	rm -f /data/wpa_supplicant.conf \
+		/data/hostapd-ap.conf \
+		/data/lighttpd-wifi-setup.conf 2>/dev/null || true
+	# Ensure setup AP address is present in settings (default 192.168.4.1).
+	if [ -f /usr/share/wifi-setup/wifi-conf-lib.sh ]; then
+		# shellcheck source=/dev/null
+		. /usr/share/wifi-setup/wifi-conf-lib.sh
+		wifi_conf_ensure_setup_defaults
+	fi
+}
+
+has_networks() {
+	[ -f "$CONF" ] && grep -q 'ssid=' "$CONF" 2>/dev/null
+}
+
+start_setup_ap() {
+	. /usr/share/wifi-setup/wifi-conf-lib.sh
+	wifi_load_setup_ap
+	log "starting setup AP (configure via http://$AP_IP/)"
+	/usr/sbin/wifi-ap-start || {
+		log "setup AP failed"
+		exit 1
+	}
+	exit 0
+}
 
 cleanup_stale() {
 	# Problem: re-ExecStart / manual wifi-connect with a live wpa_supplicant or
@@ -88,12 +128,27 @@ cleanup_stale() {
 	sleep 1
 }
 
+recover_iface() {
+	# After a hard AP teardown brcmfmac sometimes drops wlan0 entirely.
+	if [ -d "/sys/class/net/$IFACE" ]; then
+		return 0
+	fi
+	log "$IFACE missing; reloading brcmfmac"
+	modprobe -r brcmfmac brcmutil 2>/dev/null || true
+	sleep 2
+	modprobe brcmfmac 2>/dev/null || true
+}
+
 wait_iface() {
 	# Problem: brcmfmac creates the netdev after the unit starts; without a
 	# wait this is a false failure.
 	i=0
 	while [ "$i" -lt "$WAIT_IFACE_SEC" ]; do
 		[ -d "/sys/class/net/$IFACE" ] && return 0
+		# One recovery attempt mid-wait (AP→STA race / firmware hang).
+		if [ "$i" -eq 5 ]; then
+			recover_iface
+		fi
 		i=$((i + 1))
 		sleep 1
 	done
@@ -134,8 +189,23 @@ wait_associated() {
 	return 1
 }
 
-wait_iface
+if ! wait_iface; then
+	# Last-resort recovery before giving up (otherwise device has only lo).
+	recover_iface
+	wait_iface || {
+		log "cannot bring up $IFACE"
+		exit 1
+	}
+fi
+migrate_legacy_conf
 cleanup_stale
+
+if ! has_networks; then
+	log "no WiFi networks in $CONF"
+	[ "$AP_FALLBACK" = "1" ] && start_setup_ap
+	log "AP fallback disabled and no networks configured"
+	exit 1
+fi
 
 ip link set "$IFACE" down 2>/dev/null || true
 ip link set "$IFACE" up
@@ -151,8 +221,22 @@ while [ "$i" -lt 10 ]; do
 	sleep 1
 done
 
-wait_associated
+if ! wait_associated; then
+	killall wpa_supplicant 2>/dev/null || true
+	if [ "$AP_FALLBACK" = "1" ]; then
+		start_setup_ap
+	fi
+	exit 1
+fi
 
 ip -4 addr flush dev "$IFACE" 2>/dev/null || true
-udhcpc -i "$IFACE" -n -q -t 10 -T 3
+if ! udhcpc -i "$IFACE" -n -q -t 10 -T 3; then
+	killall wpa_supplicant udhcpc 2>/dev/null || true
+	if [ "$AP_FALLBACK" = "1" ]; then
+		start_setup_ap
+	fi
+	exit 1
+fi
+
+printf 'sta\n' > /run/wifi-mode
 log "DHCP done; operstate=$(cat /sys/class/net/$IFACE/operstate 2>/dev/null || echo ?)"

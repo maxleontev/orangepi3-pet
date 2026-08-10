@@ -9,7 +9,7 @@ LICENSE = "MIT"
 # override the key dir onto /data below so host keys survive reboot).
 IMAGE_FEATURES += "splash read-only-rootfs"
 
-IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init mc sd-to-emmc root-ssh-keys ab-update"
+IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init hostapd dnsmasq mc sd-to-emmc root-ssh-keys ab-update"
 IMAGE_INSTALL:append = " weston weston-init info-panel kmscube display-rf-blacklist"
 
 
@@ -89,6 +89,6 @@ khepri_gpt_rootfs_layout() {
 [Unit]
 RequiresMountsFor=/data
 EOF
-    install -m 0600 ${THISDIR}/../../recipes-wifi/wifi-init/files/wpa_supplicant.conf \
-        ${IMAGE_ROOTFS}/data/wpa_supplicant.conf
+    install -m 0600 ${THISDIR}/../../recipes-wifi/wifi-init/files/wifi.conf \
+        ${IMAGE_ROOTFS}/data/wifi.conf
 }
