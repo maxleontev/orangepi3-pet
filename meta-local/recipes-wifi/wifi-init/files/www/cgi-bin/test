@@ -1,0 +1,45 @@
+#!/bin/sh
+# Start a background STA connection test (does not save /data/wifi.conf).
+set -eu
+
+. /usr/share/wifi-setup/www/cgi-bin/form-parse.sh
+
+read_post
+parse_post
+
+# Prefer explicit ssid/psk; else first network row from the form.
+ssid=${ssid:-${ssid_0:-}}
+psk=${psk:-${psk_0:-}}
+
+echo "Content-Type: application/json; charset=utf-8"
+echo "Cache-Control: no-store"
+echo ""
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+if [ -z "$ssid" ]; then
+	printf '{"ok":false,"status":"fail","reason":"missing_ssid"}\n'
+	exit 0
+fi
+
+if [ -f /run/wifi-test.lock ]; then
+	# Allow stale locks (>3 min)
+	if [ -z "$(find /run/wifi-test.lock -mmin +3 2>/dev/null)" ]; then
+		printf '{"ok":false,"status":"fail","reason":"busy"}\n'
+		exit 0
+	fi
+	rm -f /run/wifi-test.lock
+fi
+
+esc=$(json_escape "$ssid")
+printf '{"status":"testing","connected":false,"ssid":"%s","reason":"starting","ip":""}\n' "$esc" > /run/wifi-test-result
+
+# Respond first; teardown of AP happens in the background.
+printf '{"ok":true,"status":"testing","ssid":"%s"}\n' "$esc"
+
+(
+	sleep 1
+	/usr/sbin/wifi-test-connect "$ssid" "$psk"
+) >/tmp/wifi-test-connect.log 2>&1 &

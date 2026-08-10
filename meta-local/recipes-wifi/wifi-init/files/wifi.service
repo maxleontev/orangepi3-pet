@@ -1,23 +1,12 @@
 # WiFi connection for Orange Pi 3 (AP6256 / brcmfmac).
 #
-# Why oneshot + /usr/sbin/wifi-connect instead of several ExecStartPre lines:
-# the old unit marked the service successful right after starting
-# wpa_supplicant/udhcpc without checking COMPLETED → active while
-# operstate=down and a stale IPv4. The script waits for association; on
-# failure exit≠0 and Restart=on-failure retries (typical after reboot: late
-# firmware, scan glitch, brief AP outage).
-#
-# Do NOT use ConditionPathExists on wlan0: the netdev appears asynchronously
-# after SDIO/firmware; the condition permanently skips the unit.
-# After=...wlan0.device is a soft ordering hint, not a substitute for the
-# wait loop in the script.
-#
-# ExecStop cleans wpa/udhcpc and brings the link down; wifi-roam is tied via
-# PartOf and stops with this unit.
+# wifi-connect tries STA first (/data/wifi.conf). On missing config
+# or failed association/DHCP it starts a setup AP (wifi-ap-start) and exits 0
+# so dependent units (Weston) are not blocked. wifi-roam runs only in STA mode.
 
 [Unit]
 Description=WiFi connection (brcmfmac / AP6256)
-Documentation=file:///data/wpa_supplicant.conf
+Documentation=file:///data/wifi.conf
 Wants=network.target
 After=network.target systemd-modules-load.service sys-subsystem-net-devices-wlan0.device
 RequiresMountsFor=/data
@@ -26,11 +15,8 @@ RequiresMountsFor=/data
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/wifi-connect
-Restart=on-failure
-RestartSec=5
-StartLimitIntervalSec=0
-TimeoutStartSec=120
-ExecStop=/bin/sh -c 'killall udhcpc 2>/dev/null || true; if [ -f /run/wpa_supplicant-wlan0.pid ]; then kill "$(cat /run/wpa_supplicant-wlan0.pid)" 2>/dev/null || true; fi; killall wpa_supplicant 2>/dev/null || true; ip link set wlan0 down 2>/dev/null || true'
+ExecStop=/usr/sbin/wifi-ap-stop
+TimeoutStartSec=180
 
 [Install]
 WantedBy=multi-user.target

@@ -33,6 +33,11 @@
 set -eu
 
 IFACE="${IFACE:-wlan0}"
+
+if [ -f /run/wifi-mode ] && [ "$(cat /run/wifi-mode)" = "ap" ]; then
+	exit 0
+fi
+
 # Switch only if another network is at least this many dB stronger.
 MARGIN_DB="${MARGIN_DB:-6}"
 INTERVAL_SEC="${INTERVAL_SEC:-20}"

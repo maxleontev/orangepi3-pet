@@ -1,0 +1,69 @@
+#!/bin/sh
+# Save WiFi credentials from setup web form and restart wifi.service.
+set -eu
+
+. /usr/share/wifi-setup/www/cgi-bin/form-parse.sh
+
+read_post
+parse_post
+
+echo "Content-Type: text/html; charset=utf-8"
+echo ""
+
+set --
+i=0
+while [ "$i" -lt "${network_count:-0}" ]; do
+	eval "ssid=\${ssid_$i:-}"
+	eval "psk=\${psk_$i:-}"
+	if [ -n "$ssid" ]; then
+		set -- "$@" "${ssid}:${psk}"
+	fi
+	i=$((i + 1))
+done
+
+if [ "$#" -eq 0 ]; then
+	cat <<'EOF'
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>WiFi</title></head>
+<body><h1>Error</h1><p>Enter at least one network.</p>
+<p><a href="/">Back</a></p></body></html>
+EOF
+	exit 0
+fi
+
+/usr/sbin/wifi-write-config "$@"
+
+AP_IP=
+if [ -f /run/wifi-setup-ap-ip ]; then
+	AP_IP=$(cat /run/wifi-setup-ap-ip)
+fi
+if [ -z "$AP_IP" ] && [ -f /usr/share/wifi-setup/wifi-conf-lib.sh ]; then
+	# shellcheck source=/dev/null
+	. /usr/share/wifi-setup/wifi-conf-lib.sh
+	wifi_load_setup_ap
+fi
+AP_IP="${AP_IP:-192.168.4.1}"
+
+# Respond BEFORE tearing down the AP. Calling wifi-ap-stop here killed lighttpd
+# mid-request and often left brcmfmac without wlan0. Let systemd ExecStop handle
+# teardown after the browser has the success page.
+cat <<EOF
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>WiFi</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+</style>
+</head>
+<body>
+<h1>Saved</h1>
+<p>Settings were written. In a few seconds the setup access point will go offline while the device tries to join your router.</p>
+<p>If connection fails, the <strong>Khepri-Setup-*</strong> network will appear again (setup page at http://${AP_IP}/).</p>
+</body></html>
+EOF
+
+# Detach restart so CGI/lighttpd can finish sending the response.
+(
+	sleep 2
+	systemctl restart wifi.service
+) >/dev/null 2>&1 &

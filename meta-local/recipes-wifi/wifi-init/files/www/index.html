@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiFi Setup — Khepri</title>
+<style>
+body { font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+h1 { font-size: 1.4rem; }
+.network { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+label { display: block; margin-top: 0.5rem; font-weight: 600; }
+input, select { width: 100%; box-sizing: border-box; padding: 0.5rem; margin-top: 0.25rem; font-size: 1rem; }
+button { padding: 0.6rem 1.2rem; margin-top: 1rem; margin-right: 0.5rem; font-size: 1rem; }
+button:disabled { opacity: 0.55; }
+.row { display: flex; gap: 0.5rem; align-items: flex-end; }
+.row > * { flex: 1; }
+.row button { flex: 0 0 auto; margin-top: 0.25rem; }
+.note { color: #444; font-size: 0.95rem; line-height: 1.4; }
+.status { font-size: 0.9rem; color: #666; min-height: 1.2em; }
+.manual { display: none; }
+.test-box {
+  margin: 0.75rem 0 0; padding: 0.9rem 1rem; border-radius: 8px;
+  font-size: 1rem; line-height: 1.45; border: 1px solid transparent;
+}
+.test-box.ok { background: #e7f6ec; color: #146c2e; border-color: #b7e4c7; }
+.test-box.fail { background: #fdecea; color: #8a1f11; border-color: #f5c2c0; }
+.test-box.testing { background: #fff6e5; color: #7a4d00; border-color: #f0d9a8; }
+.test-box.idle { display: none; }
+.test-box .countdown {
+  display: block; margin-top: 0.35rem;
+  font-size: 1.75rem; font-weight: 700; letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.actions { margin-top: 0.5rem; }
+</style>
+</head>
+<body>
+<h1>WiFi Setup</h1>
+<p class="note">This device could not connect to a router. Join the <strong>Khepri-Setup-*</strong> access point, then pick a network and use <strong>Test connection</strong> (max 20s) before saving.</p>
+<p class="status" id="scan-status">Loading network list…</p>
+
+<form method="post" action="/cgi-bin/save" id="wifi-form">
+<input type="hidden" name="network_count" id="network_count" value="1">
+<div id="networks">
+  <div class="network" data-index="0"></div>
+</div>
+<button type="button" id="add-btn">+ Add network</button>
+<button type="button" id="rescan-btn">Refresh list</button>
+<button type="submit">Save and connect</button>
+</form>
+
+<script>
+const networks = document.getElementById('networks');
+const countInput = document.getElementById('network_count');
+const scanStatus = document.getElementById('scan-status');
+const TEST_FLAG = 'khepri_wifi_test_pending';
+const TEST_DEADLINE = 'khepri_wifi_test_deadline';
+const TEST_SSID = 'khepri_wifi_test_ssid';
+const TEST_SECS = 20;
+let next = 1;
+let ssidList = [];
+let pollTimer = null;
+let countdownTimer = null;
+let activeTestBox = null;
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/"/g, '&quot;');
+}
+
+function optionHtml(list) {
+  let html = '<option value="">— select a network —</option>';
+  list.forEach((item) => {
+    const ssid = item.ssid || item;
+    const sig = item.signal != null ? ` (${item.signal} dBm)` : '';
+    html += `<option value="${esc(ssid)}">${esc(ssid)}${esc(sig)}</option>`;
+  });
+  html += '<option value="__manual__">Other network…</option>';
+  return html;
+}
+
+function fillSelects() {
+  document.querySelectorAll('select.ssid-pick').forEach((sel) => {
+    const prev = sel.value;
+    sel.innerHTML = optionHtml(ssidList);
+    if (prev && [...sel.options].some((o) => o.value === prev)) {
+      sel.value = prev;
+    }
+    sel.dispatchEvent(new Event('change'));
+  });
+}
+
+function networkCreds(root) {
+  const pick = root.querySelector('.ssid-pick');
+  const manual = root.querySelector('.ssid-manual');
+  const hidden = root.querySelector('.ssid-value');
+  const psk = root.querySelector('input[type="password"]');
+  const ssid = pick.value === '__manual__'
+    ? (manual.value || '').trim()
+    : (hidden.value || '').trim();
+  return { ssid, psk: (psk && psk.value) || '' };
+}
+
+function wireNetwork(root) {
+  const idx = root.dataset.index;
+  root.innerHTML = `
+    <label>Network (SSID)</label>
+    <div class="row">
+      <select class="ssid-pick" data-index="${idx}" aria-label="Network list">
+        ${optionHtml(ssidList)}
+      </select>
+    </div>
+    <div class="manual" data-manual="${idx}">
+      <label>SSID (manual)</label>
+      <input class="ssid-manual" autocomplete="off" placeholder="Network name">
+    </div>
+    <input type="hidden" class="ssid-value" name="ssid_${idx}" value="">
+    <label>Password (WPA)</label>
+    <input name="psk_${idx}" type="password" autocomplete="new-password">
+    <div class="actions">
+      <button type="button" class="test-btn">Test connection</button>
+    </div>
+    <div class="test-box idle" data-test-box role="status" aria-live="polite"></div>
+  `;
+  const pick = root.querySelector('.ssid-pick');
+  const manualWrap = root.querySelector('.manual');
+  const manual = root.querySelector('.ssid-manual');
+  const hidden = root.querySelector('.ssid-value');
+
+  function sync() {
+    if (pick.value === '__manual__') {
+      manualWrap.style.display = 'block';
+      manual.name = `ssid_${idx}`;
+      hidden.name = '';
+      hidden.value = '';
+      manual.required = true;
+    } else if (pick.value) {
+      manualWrap.style.display = 'none';
+      manual.name = '';
+      manual.required = false;
+      hidden.name = `ssid_${idx}`;
+      hidden.value = pick.value;
+    } else {
+      manualWrap.style.display = 'none';
+      manual.name = '';
+      manual.required = false;
+      hidden.name = `ssid_${idx}`;
+      hidden.value = '';
+    }
+  }
+  pick.addEventListener('change', sync);
+  sync();
+
+  root.querySelector('.test-btn').addEventListener('click', () => startTest(root));
+}
+
+function remainingSecs() {
+  const dl = Number(sessionStorage.getItem(TEST_DEADLINE) || 0);
+  if (!dl) return TEST_SECS;
+  return Math.max(0, Math.ceil((dl - Date.now()) / 1000));
+}
+
+function setTestUi(box, kind, html) {
+  if (!box) return;
+  box.className = 'test-box ' + kind;
+  box.innerHTML = html;
+}
+
+function reasonText(reason) {
+  const r = String(reason || '');
+  if (r === 'connected') return 'Associated and got an IP address.';
+  if (r === 'dhcp_failed' || r === 'dhcp_timeout') return 'Associated, but DHCP failed.';
+  if (r.indexOf('no_associate') === 0) return 'Could not associate (wrong password or out of range).';
+  if (r === 'missing_ssid') return 'SSID is required.';
+  if (r === 'busy') return 'A test is already running.';
+  if (r === 'in_progress' || r === 'starting') return 'Test in progress…';
+  return r || 'Unknown result.';
+}
+
+function testingHtml(ssid, secs) {
+  const s = secs == null ? remainingSecs() : secs;
+  return (
+    `<strong>Testing${ssid ? ' “' + esc(ssid) + '”' : ''}…</strong>` +
+    `<span class="countdown">${s}s</span>` +
+    'Rejoin <strong>Khepri-Setup-*</strong> if disconnected. Result appears here when the AP returns.'
+  );
+}
+
+function showTestResult(box, data) {
+  const ssid = data.ssid || sessionStorage.getItem(TEST_SSID) || '';
+  if (data.status === 'testing') {
+    setTestUi(box, 'testing', testingHtml(ssid));
+    return;
+  }
+  stopCountdown();
+  if (data.status === 'ok' && data.connected) {
+    setTestUi(box, 'ok',
+      `<strong>Connected</strong> to <strong>${esc(ssid)}</strong>` +
+      (data.ip ? ` (IP ${esc(data.ip)})` : '') +
+      '.<br>You can Save and connect when ready.');
+    return;
+  }
+  if (data.status === 'fail') {
+    setTestUi(box, 'fail',
+      `<strong>Not connected</strong>` +
+      (ssid ? ` to <strong>${esc(ssid)}</strong>` : '') +
+      '.<br>' + esc(reasonText(data.reason)));
+    return;
+  }
+  box.className = 'test-box idle';
+  box.innerHTML = '';
+}
+
+async function fetchTestStatus() {
+  const res = await fetch('/cgi-bin/test-status', { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+function stopCountdown() {
+  if (countdownTimer) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+}
+
+function stopPoll() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function startCountdown(box) {
+  stopCountdown();
+  activeTestBox = box;
+  const tick = () => {
+    const secs = remainingSecs();
+    const ssid = sessionStorage.getItem(TEST_SSID) || '';
+    if (box && box.classList.contains('testing')) {
+      setTestUi(box, 'testing', testingHtml(ssid, secs));
+    }
+    if (secs <= 0) stopCountdown();
+  };
+  tick();
+  countdownTimer = setInterval(tick, 250);
+}
+
+function finishTestUi(box) {
+  sessionStorage.removeItem(TEST_FLAG);
+  sessionStorage.removeItem(TEST_DEADLINE);
+  sessionStorage.removeItem(TEST_SSID);
+  stopPoll();
+  stopCountdown();
+  document.querySelectorAll('.test-btn').forEach((b) => { b.disabled = false; });
+}
+
+function startPoll(box) {
+  stopPoll();
+  activeTestBox = box || activeTestBox || document.querySelector('[data-test-box]');
+  let tries = 0;
+  pollTimer = setInterval(async () => {
+    tries += 1;
+    const target = activeTestBox;
+    try {
+      const data = await fetchTestStatus();
+      showTestResult(target, data);
+      if (data.status === 'ok' || data.status === 'fail') {
+        finishTestUi(target);
+      } else if (data.status === 'testing') {
+        startCountdown(target);
+      }
+    } catch (e) {
+      const ssid = sessionStorage.getItem(TEST_SSID) || '';
+      setTestUi(target, 'testing', testingHtml(ssid));
+    }
+    // 20s test + AP restore slack
+    if (tries > 40) {
+      setTestUi(target, 'fail', '<strong>Test timed out.</strong> Rejoin the setup AP and try again.');
+      finishTestUi(target);
+    }
+  }, 1000);
+}
+
+async function startTest(root) {
+  const { ssid, psk } = networkCreds(root);
+  const box = root.querySelector('[data-test-box]');
+  if (!ssid) {
+    setTestUi(box, 'fail', '<strong>Not connected</strong><br>Select or enter an SSID first.');
+    return;
+  }
+  document.querySelectorAll('.test-btn').forEach((b) => { b.disabled = true; });
+  document.querySelectorAll('[data-test-box]').forEach((el) => {
+    if (el !== box) {
+      el.className = 'test-box idle';
+      el.innerHTML = '';
+    }
+  });
+  sessionStorage.setItem(TEST_FLAG, '1');
+  sessionStorage.setItem(TEST_SSID, ssid);
+  sessionStorage.setItem(TEST_DEADLINE, String(Date.now() + TEST_SECS * 1000));
+  activeTestBox = box;
+  showTestResult(box, { status: 'testing', ssid });
+  startCountdown(box);
+  try {
+    const body = new URLSearchParams({ ssid, psk });
+    const res = await fetch('/cgi-bin/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      cache: 'no-store',
+    });
+    const data = await res.json();
+    if (!data.ok && (data.reason === 'busy' || data.reason === 'missing_ssid')) {
+      setTestUi(box, 'fail',
+        '<strong>Not connected</strong><br>' + esc(reasonText(data.reason)));
+      finishTestUi(box);
+      return;
+    }
+  } catch (e) {
+    // Expected once AP goes down mid-flight
+  }
+  startPoll(box);
+}
+
+async function resumeTestIfNeeded() {
+  const pending = sessionStorage.getItem(TEST_FLAG);
+  const box = document.querySelector('[data-test-box]');
+  try {
+    const data = await fetchTestStatus();
+    if (data.status === 'testing' || pending) {
+      if (!sessionStorage.getItem(TEST_DEADLINE)) {
+        sessionStorage.setItem(TEST_DEADLINE, String(Date.now() + TEST_SECS * 1000));
+      }
+      if (data.ssid) sessionStorage.setItem(TEST_SSID, data.ssid);
+      sessionStorage.setItem(TEST_FLAG, '1');
+      document.querySelectorAll('.test-btn').forEach((b) => { b.disabled = true; });
+      activeTestBox = box;
+      showTestResult(box, data.status === 'testing' ? data : { status: 'testing', ssid: data.ssid || '' });
+      startCountdown(box);
+      startPoll(box);
+      return;
+    }
+    if (data.status === 'ok' || data.status === 'fail') {
+      showTestResult(box, data);
+    }
+  } catch (e) {
+    if (pending) {
+      activeTestBox = box;
+      startCountdown(box);
+      startPoll(box);
+    }
+  }
+}
+
+async function loadScan(refresh) {
+  scanStatus.textContent = refresh ? 'Scanning…' : 'Loading network list…';
+  try {
+    const url = refresh ? '/cgi-bin/scan?refresh=1' : '/cgi-bin/scan';
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    ssidList = await res.json();
+    if (!Array.isArray(ssidList)) ssidList = [];
+    fillSelects();
+    scanStatus.textContent = ssidList.length
+      ? `Networks found: ${ssidList.length}`
+      : 'No networks found — enter an SSID manually (Other network…).';
+  } catch (e) {
+    scanStatus.textContent = 'Could not load the list — enter an SSID manually.';
+  }
+}
+
+document.getElementById('add-btn').addEventListener('click', () => {
+  const idx = next++;
+  const div = document.createElement('div');
+  div.className = 'network';
+  div.dataset.index = String(idx);
+  networks.appendChild(div);
+  wireNetwork(div);
+  countInput.value = String(next);
+});
+
+document.getElementById('rescan-btn').addEventListener('click', () => loadScan(true));
+
+document.getElementById('wifi-form').addEventListener('submit', (ev) => {
+  const blocks = networks.querySelectorAll('.network');
+  let ok = false;
+  blocks.forEach((root) => {
+    const { ssid } = networkCreds(root);
+    if (ssid) ok = true;
+  });
+  if (!ok) {
+    ev.preventDefault();
+    scanStatus.textContent = 'Select a network from the list or enter an SSID manually.';
+  }
+});
+
+wireNetwork(networks.querySelector('.network'));
+loadScan(false).then(() => loadScan(true));
+resumeTestIfNeeded();
+</script>
+</body>
+</html>
