@@ -17,9 +17,10 @@
 
 [Unit]
 Description=WiFi connection (brcmfmac / AP6256)
-Documentation=file:///etc/wpa_supplicant.conf
+Documentation=file:///data/wpa_supplicant.conf
 Wants=network.target
 After=network.target systemd-modules-load.service sys-subsystem-net-devices-wlan0.device
+RequiresMountsFor=/data
 
 [Service]
 Type=oneshot

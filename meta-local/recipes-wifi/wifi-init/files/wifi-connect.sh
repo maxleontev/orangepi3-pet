@@ -64,7 +64,7 @@
 #    unit with a stale IP.
 #
 # 8. Dual SSID (2.4 + 5 GHz) and band selection
-#    SSID list lives in /etc/wpa_supplicant.conf. Ongoing choice by measured
+#    SSID list lives in /data/wpa_supplicant.conf. Ongoing choice by measured
 #    RSSI is wifi-roam (wpa priority alone will not leave a weaker COMPLETED
 #    BSS for a louder one on the other band).
 #
@@ -73,7 +73,7 @@
 set -eu
 
 IFACE="${IFACE:-wlan0}"
-CONF="${CONF:-/etc/wpa_supplicant.conf}"
+CONF="${CONF:-/data/wpa_supplicant.conf}"
 WAIT_IFACE_SEC="${WAIT_IFACE_SEC:-30}"
 WAIT_ASSOC_SEC="${WAIT_ASSOC_SEC:-60}"
 

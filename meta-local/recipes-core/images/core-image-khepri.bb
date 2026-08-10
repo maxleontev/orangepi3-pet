@@ -89,4 +89,6 @@ khepri_gpt_rootfs_layout() {
 [Unit]
 RequiresMountsFor=/data
 EOF
+    install -m 0600 ${THISDIR}/../../recipes-wifi/wifi-init/files/wpa_supplicant.conf \
+        ${IMAGE_ROOTFS}/data/wpa_supplicant.conf
 }
