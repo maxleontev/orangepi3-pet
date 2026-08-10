@@ -1,0 +1,53 @@
+---
+description: General coding and workflow standards for the Orange Pi 3 Yocto project
+alwaysApply: true
+---
+
+# Orange Pi 3 Project Standards
+
+## Scope
+
+- Custom work lives in `meta-local/` (recipes, scripts, machine config).
+- Do not edit upstream layers (`poky/`, `meta-sunxi/`, `meta-arm/`, …) unless fixing an upstream bug or the user asks.
+- Image target: `core-image-khepri` for Orange Pi 3 (`orange-pi-3` machine).
+
+## Shell Scripts
+
+Host scripts: `meta-local/scripts/`. On-target tools: `meta-local/recipes-support/*/files/` → `/usr/sbin/*`.
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s\n' "$*"; }
+
+TARGET="${TARGET:-root@192.168.3.71}"   # env overrides with sensible defaults
+```
+
+- Use `#!/bin/bash` + `pipefail` on host; `#!/bin/sh` + `set -eu` on target (BusyBox).
+- Configurable behavior via env vars, not positional args (see existing scripts).
+- Add a header comment and `usage()` for user-facing tools.
+- When changing scripts or on-target tools, update `README.md` or `meta-local/scripts/README.md`.
+
+## Yocto / Recipes
+
+- Prefer `.bbappend` over copying upstream recipes.
+- Install files via `SRC_URI`, `do_install`, and `FILES:${PN}` — not ad-hoc rootfs edits.
+- `local.conf` must include `require conf/distro/include/orangepi3-graphics.inc`.
+
+## A/B Updates & Flashing
+
+After rebuilding the image, flash/update with:
+
+```bash
+bitbake core-image-khepri
+SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host
+```
+
+- Use `push-ab-update.sh` for deploy-and-verify; do not hand-roll SSH update steps.
+
+## General
+
+- Minimize diff scope; match surrounding naming and style.
+- Only commit or push when the user explicitly asks.
