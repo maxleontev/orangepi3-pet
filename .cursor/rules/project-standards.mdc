@@ -46,6 +46,8 @@ SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host
 ```
 
 - Use `push-ab-update.sh` for deploy-and-verify; do not hand-roll SSH update steps.
+- do not change push-ab-update.sh itself
+
 
 ## General
 
