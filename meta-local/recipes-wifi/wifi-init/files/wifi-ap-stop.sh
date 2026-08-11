@@ -41,5 +41,5 @@ rm -f /run/hostapd-ap.conf 2>/dev/null || true
 if [ -d "/sys/class/net/$IFACE" ]; then
 	ip -4 addr flush dev "$IFACE" 2>/dev/null || true
 fi
-rm -f /run/wifi-mode /run/wifi-setup-ap-ip /run/dnsmasq-ap.conf
+rm -f /run/wifi-mode /run/wifi-setup-ap-ip /run/wifi-setup-ap-ssid /run/dnsmasq-ap.conf
 log "setup AP stopped"
