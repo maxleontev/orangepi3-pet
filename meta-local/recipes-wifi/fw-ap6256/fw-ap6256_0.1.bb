@@ -4,6 +4,7 @@ LICENSE = "CLOSED"
 # Откуда брать файлы
 SRC_URI = " \
     file://brcmfmac43456-sdio.bin \
+    file://brcmfmac43456-sdio.clm_blob \
     file://brcmfmac43456-sdio.txt \
 "
 
@@ -11,6 +12,7 @@ SRC_URI = " \
 do_install() {
     install -d ${D}${base_libdir}/firmware/brcm
     install -m 0644 ${WORKDIR}/brcmfmac43456-sdio.bin ${D}${base_libdir}/firmware/brcm/
+    install -m 0644 ${WORKDIR}/brcmfmac43456-sdio.clm_blob ${D}${base_libdir}/firmware/brcm/
     install -m 0644 ${WORKDIR}/brcmfmac43456-sdio.txt ${D}${base_libdir}/firmware/brcm/
     # Board-specific names requested by brcmfmac from DTB compatible
     ln -sf brcmfmac43456-sdio.bin ${D}${base_libdir}/firmware/brcm/brcmfmac43456-sdio.xunlong,orangepi-3-lts.bin
