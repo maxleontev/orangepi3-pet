@@ -1,5 +1,6 @@
 /*
- * Fullscreen Wayland info panel: CPU temp/usage, memory, IP, WiFi SSID.
+ * Fullscreen Wayland info panel: CPU temp/usage, memory, uptime, STA IP/SSID,
+ * and setup-AP SSID/IP when hostapd mode is active.
  * Composited by Weston on DRM/KMS; GPU path is Mesa Lima (Mali).
  */
 
@@ -35,9 +36,12 @@ struct panel_metrics {
 	bool cores_ok;
 	unsigned long mem_total_kb;
 	unsigned long mem_avail_kb;
+	char uptime[32];
 	char ip[INET_ADDRSTRLEN];
 	char iface[32];
 	char wifi_ssid[33]; /* IEEE 802.11 SSID max 32 octets */
+	char ap_ssid[33];
+	char ap_ip[INET_ADDRSTRLEN];
 	char hostname[64];
 };
 
@@ -377,14 +381,155 @@ static void read_wifi_ssid(char *ssid, size_t len)
 	pclose(f);
 }
 
+static void read_uptime(char *buf, size_t len)
+{
+	double up = 0.0;
+	unsigned long sec, days, hours, mins, rem;
+	FILE *f;
+
+	snprintf(buf, len, "-");
+	f = fopen("/proc/uptime", "r");
+	if (!f)
+		return;
+	if (fscanf(f, "%lf", &up) != 1) {
+		fclose(f);
+		return;
+	}
+	fclose(f);
+
+	sec = (unsigned long)up;
+	days = sec / 86400UL;
+	rem = sec % 86400UL;
+	hours = rem / 3600UL;
+	rem %= 3600UL;
+	mins = rem / 60UL;
+	rem %= 60UL;
+
+	if (days > 0)
+		snprintf(buf, len, "%lud %02lu:%02lu:%02lu", days, hours, mins, rem);
+	else
+		snprintf(buf, len, "%02lu:%02lu:%02lu", hours, mins, rem);
+}
+
+/* Setup AP (hostapd): /run/wifi-mode=ap. Prefer runtime files; iw only as fallback. */
+static void read_ap_info(char *ssid, size_t ssid_len, char *ip, size_t iplen)
+{
+	static const char *const cmds[] = {
+		"/usr/sbin/iw dev wlan0 info 2>/dev/null",
+		"/sbin/iw dev wlan0 info 2>/dev/null",
+		"iw dev wlan0 info 2>/dev/null",
+		NULL,
+	};
+	char mode[16];
+	char line[256];
+	FILE *f;
+	int i;
+	size_t mi;
+	bool is_ap = false;
+	bool have_ssid = false;
+
+	snprintf(ssid, ssid_len, "-");
+	snprintf(ip, iplen, "-");
+
+	f = fopen("/run/wifi-mode", "r");
+	if (!f)
+		return;
+	if (!fgets(mode, sizeof(mode), f)) {
+		fclose(f);
+		return;
+	}
+	fclose(f);
+	for (mi = 0; mode[mi]; mi++) {
+		if (mode[mi] == '\r' || mode[mi] == '\n') {
+			mode[mi] = '\0';
+			break;
+		}
+	}
+	if (strcmp(mode, "ap") != 0)
+		return;
+
+	/* Fast path: files written by wifi-ap-start (no iw). */
+	f = fopen("/run/wifi-setup-ap-ssid", "r");
+	if (f) {
+		if (fgets(line, sizeof(line), f)) {
+			size_t n = strcspn(line, "\r\n");
+			if (n > 0) {
+				if (n >= ssid_len)
+					n = ssid_len - 1;
+				memcpy(ssid, line, n);
+				ssid[n] = '\0';
+				have_ssid = true;
+			}
+		}
+		fclose(f);
+	}
+	f = fopen("/run/wifi-setup-ap-ip", "r");
+	if (f) {
+		if (fgets(line, sizeof(line), f)) {
+			size_t n = strcspn(line, "\r\n");
+			if (n > 0 && n < iplen) {
+				memcpy(ip, line, n);
+				ip[n] = '\0';
+			}
+		}
+		fclose(f);
+	}
+	if (have_ssid && strcmp(ip, "-") != 0)
+		return;
+
+	for (i = 0; cmds[i]; i++) {
+		f = popen(cmds[i], "r");
+		if (f)
+			break;
+	}
+	if (f) {
+		while (fgets(line, sizeof(line), f)) {
+			char *p = line;
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (strncmp(p, "type AP", 7) == 0)
+				is_ap = true;
+			if (!have_ssid && strncmp(p, "ssid ", 5) == 0) {
+				p += 5;
+				while (*p == ' ' || *p == '\t')
+					p++;
+				size_t n = strcspn(p, "\r\n");
+				if (n > 0) {
+					if (n >= ssid_len)
+						n = ssid_len - 1;
+					memcpy(ssid, p, n);
+					ssid[n] = '\0';
+					have_ssid = true;
+				}
+			}
+		}
+		pclose(f);
+	}
+
+	if (!is_ap && !have_ssid) {
+		snprintf(ssid, ssid_len, "-");
+		snprintf(ip, iplen, "-");
+		return;
+	}
+
+	if (strcmp(ip, "-") == 0) {
+		char iface[32];
+		read_primary_ipv4(ip, iplen, iface, sizeof(iface));
+		if (strcmp(iface, "wlan0") != 0)
+			snprintf(ip, iplen, "-");
+	}
+}
+
 static void metrics_refresh(struct panel_metrics *m)
 {
 	m->cpu_c = read_cpu_temp_c();
 	m->cpu_ok = m->cpu_c >= 0.0;
 	read_cpu_core_usage(m);
 	read_meminfo(&m->mem_total_kb, &m->mem_avail_kb);
+	read_uptime(m->uptime, sizeof(m->uptime));
 	read_primary_ipv4(m->ip, sizeof(m->ip), m->iface, sizeof(m->iface));
 	read_wifi_ssid(m->wifi_ssid, sizeof(m->wifi_ssid));
+	read_ap_info(m->ap_ssid, sizeof(m->ap_ssid), m->ap_ip, sizeof(m->ap_ip));
 	if (gethostname(m->hostname, sizeof(m->hostname)) != 0)
 		snprintf(m->hostname, sizeof(m->hostname), "orangepi3");
 	m->hostname[sizeof(m->hostname) - 1] = '\0';
@@ -414,11 +559,12 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_rectangle(cr, 0, 0, w, h * 0.01);
 	cairo_fill(cr);
 
-	double title_size = h * 0.08;
-	double body_size = h * 0.055;
-	double small_size = h * 0.035;
+	double title_size = h * 0.07;
+	double body_size = h * 0.048;
+	double small_size = h * 0.032;
 	double x = w * 0.08;
-	double y = h * 0.18;
+	double y = h * 0.15;
+	double row = body_size * 1.28;
 
 	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
 	cairo_set_font_size(cr, title_size);
@@ -426,7 +572,7 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, "Orange Pi 3");
 
-	y += title_size * 0.9;
+	y += title_size * 0.85;
 	cairo_set_font_size(cr, small_size);
 	cairo_set_source_rgb(cr, 0.55, 0.65, 0.75);
 	cairo_move_to(cr, x, y);
@@ -434,7 +580,7 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_move_to(cr, x + w * 0.35, y);
 	cairo_show_text(cr, timestr);
 
-	y += body_size * 1.6;
+	y += body_size * 1.45;
 	cairo_set_font_size(cr, body_size);
 	cairo_set_source_rgb(cr, 0.75, 0.82, 0.90);
 	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
@@ -446,7 +592,7 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, line);
 
-	y += body_size * 1.35;
+	y += row;
 	if (m->cores_ok && m->ncpus > 0) {
 		char *p = line;
 		size_t left = sizeof(line);
@@ -470,7 +616,7 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, line);
 
-	y += body_size * 1.35;
+	y += row;
 	if (m->mem_total_kb > 0) {
 		double used = (double)(m->mem_total_kb - m->mem_avail_kb) / 1024.0;
 		double total = (double)m->mem_total_kb / 1024.0;
@@ -484,9 +630,9 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_show_text(cr, line);
 
 	/* Memory bar */
-	y += body_size * 0.55;
+	y += body_size * 0.5;
 	double bar_w = w * 0.70;
-	double bar_h = h * 0.018;
+	double bar_h = h * 0.016;
 	cairo_set_source_rgb(cr, 0.12, 0.18, 0.28);
 	cairo_rectangle(cr, x, y, bar_w, bar_h);
 	cairo_fill(cr);
@@ -501,18 +647,33 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 		cairo_fill(cr);
 	}
 
-	y += body_size * 1.4;
-	snprintf(line, sizeof(line), "IP address          %s  (%s)", m->ip, m->iface);
+	y += body_size * 1.25;
+	snprintf(line, sizeof(line), "Uptime              %s", m->uptime);
 	cairo_set_source_rgb(cr, 0.75, 0.82, 0.90);
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, line);
 
-	y += body_size * 1.35;
+	y += row;
+	snprintf(line, sizeof(line), "IP address          %s  (%s)", m->ip, m->iface);
+	cairo_move_to(cr, x, y);
+	cairo_show_text(cr, line);
+
+	y += row;
 	snprintf(line, sizeof(line), "WiFi                %s", m->wifi_ssid);
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, line);
 
-	y += body_size * 1.5;
+	y += row;
+	snprintf(line, sizeof(line), "AP SSID             %s", m->ap_ssid);
+	cairo_move_to(cr, x, y);
+	cairo_show_text(cr, line);
+
+	y += row;
+	snprintf(line, sizeof(line), "AP IP address       %s", m->ap_ip);
+	cairo_move_to(cr, x, y);
+	cairo_show_text(cr, line);
+
+	y += body_size * 1.35;
 	cairo_set_font_size(cr, small_size);
 	cairo_set_source_rgb(cr, 0.40, 0.50, 0.60);
 	cairo_move_to(cr, x, y);
@@ -745,7 +906,8 @@ int main(int argc, char **argv)
 
 		struct timespec ts;
 		clock_gettime(CLOCK_MONOTONIC, &ts);
-		uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+		uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL +
+				  (uint64_t)ts.tv_nsec / 1000000ULL;
 		/* ~1 Hz panel refresh. */
 		if (app.configured && (now_ms - last_ms) >= 1000) {
 			last_ms = now_ms;
