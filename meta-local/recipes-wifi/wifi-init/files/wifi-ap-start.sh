@@ -105,4 +105,6 @@ cp -f /run/lighttpd-wifi-setup.pid /run/wifi-setup-httpd.pid 2>/dev/null || true
 
 printf 'ap\n' > /run/wifi-mode
 printf '%s\n' "$AP_IP" > /run/wifi-setup-ap-ip
+printf '%s\n' "$(ap_ssid)" > /run/wifi-setup-ap-ssid
+chmod 0644 /run/wifi-setup-ap-ip /run/wifi-setup-ap-ssid 2>/dev/null || true
 log "setup AP ready: http://$AP_IP/ (SSID $(ap_ssid))"
