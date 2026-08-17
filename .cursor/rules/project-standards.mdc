@@ -42,7 +42,11 @@ After rebuilding the image, flash/update with:
 
 ```bash
 bitbake core-image-khepri
-SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host
+
+- use SSH_BIND=192.168.3.37 in case there is two host network in use and you want to use wifi, 
+- otherwise use SSH_BIND=192.168.3.6 to use host ethernet
+SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host, use wifi
+SSH_BIND=192.168.3.6 meta-local/scripts/push-ab-update.sh   # use ethernet in other cases
 ```
 
 - Use `push-ab-update.sh` for deploy-and-verify; do not hand-roll SSH update steps.
