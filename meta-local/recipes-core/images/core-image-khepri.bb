@@ -11,6 +11,7 @@ IMAGE_FEATURES += "splash read-only-rootfs"
 
 IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init hostapd dnsmasq mc sd-to-emmc root-ssh-keys ab-update"
 IMAGE_INSTALL:append = " weston weston-init info-panel kmscube display-rf-blacklist"
+IMAGE_INSTALL:append = " ac200-mic-setup alsa-utils-amixer alsa-utils-aplay"
 
 
 # Must match INITRAMFS_IMAGE in linux-mainline bbappend (kernel recipe scope).

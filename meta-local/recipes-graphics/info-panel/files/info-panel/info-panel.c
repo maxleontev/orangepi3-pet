@@ -1,15 +1,17 @@
 /*
  * Fullscreen Wayland info panel: CPU temp/usage, memory, uptime, STA IP/SSID,
- * and setup-AP SSID/IP when hostapd mode is active.
+ * setup-AP SSID/IP when hostapd mode is active, and a live mic spectrogram.
  * Composited by Weston on DRM/KMS; GPU path is Mesa Lima (Mali).
  */
 
 #define _GNU_SOURCE
+#include <alsa/asoundlib.h>
 #include <cairo/cairo.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
@@ -27,6 +29,21 @@
 #include "xdg-shell-client-protocol.h"
 
 #define MAX_CPU_CORES 8
+#define MIC_RATE 48000
+#define MIC_CHANNELS 2
+#define MIC_PERIOD 128
+#define MIC_RETRY_MS 2000
+#define INFO_SPLIT 0.56
+
+#define FFT_N 512
+#define FFT_HOP 128
+#define FFT_BINS (FFT_N / 2)
+#define SPEC_POINTS 256
+#define SPEC_MIN_HZ 40.0f
+#define SPEC_MAX_HZ 10000.0f
+#define SPEC_MIN_DB -48.0f
+#define SPEC_MAX_DB 24.0f
+#define MAX_POLL_FDS 8
 
 struct panel_metrics {
 	double cpu_c;
@@ -52,6 +69,27 @@ struct shm_buffer {
 	int width;
 	int height;
 	bool busy;
+	bool stats_valid;
+};
+
+struct mic_state {
+	snd_pcm_t *pcm;
+	unsigned channels;
+	bool ok;
+	char status[64];
+	uint64_t next_retry_ms;
+};
+
+struct spectro_state {
+	int16_t hop[FFT_N];
+	unsigned hop_fill;
+	float window[FFT_N];
+	float fft_re[FFT_N];
+	float fft_im[FFT_N];
+	float db[SPEC_POINTS];
+	float peak_db;
+	bool have_spectrum;
+	bool dirty;
 };
 
 struct app {
@@ -72,6 +110,8 @@ struct app {
 	struct shm_buffer buffers[2];
 	int buffer_idx;
 	struct panel_metrics metrics;
+	struct mic_state mic;
+	struct spectro_state spectro;
 };
 
 static int create_shm_file(size_t size)
@@ -535,14 +575,403 @@ static void metrics_refresh(struct panel_metrics *m)
 	m->hostname[sizeof(m->hostname) - 1] = '\0';
 }
 
-static void draw_panel(struct app *app, struct shm_buffer *b)
+static uint64_t monotonic_ms(void)
 {
-	cairo_surface_t *cs = cairo_image_surface_create_for_data(
-		b->data, CAIRO_FORMAT_ARGB32, b->width, b->height, b->width * 4);
-	cairo_t *cr = cairo_create(cs);
-	const struct panel_metrics *m = &app->metrics;
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void spectro_init(struct spectro_state *sp)
+{
+	for (int i = 0; i < FFT_N; i++)
+		sp->window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)(FFT_N - 1)));
+}
+
+static void fft_inplace(float *re, float *im, int n)
+{
+	int i, j, k, m;
+	float t_re, t_im, ang;
+
+	for (j = 1, i = 1; i < n; i++) {
+		if (i < j) {
+			t_re = re[i];
+			t_im = im[i];
+			re[i] = re[j];
+			im[i] = im[j];
+			re[j] = t_re;
+			im[j] = t_im;
+		}
+		m = n >> 1;
+		while (m >= 1 && j > m) {
+			j -= m;
+			m >>= 1;
+		}
+		j += m;
+	}
+
+	for (m = 2; m <= n; m <<= 1) {
+		ang = -2.0f * (float)M_PI / (float)m;
+		for (j = 0; j < m / 2; j++) {
+			float w_re = cosf(ang * (float)j);
+			float w_im = sinf(ang * (float)j);
+			for (i = j; i < n; i += m) {
+				k = i + m / 2;
+				t_re = re[k] * w_re - im[k] * w_im;
+				t_im = re[k] * w_im + im[k] * w_re;
+				re[k] = re[i] - t_re;
+				im[k] = im[i] - t_im;
+				re[i] += t_re;
+				im[i] += t_im;
+			}
+		}
+	}
+}
+
+static float mag_to_db(float mag)
+{
+	float db;
+
+	if (mag <= 1e-9f)
+		return SPEC_MIN_DB;
+	db = 20.0f * log10f(mag);
+	if (db < SPEC_MIN_DB)
+		db = SPEC_MIN_DB;
+	if (db > SPEC_MAX_DB)
+		db = SPEC_MAX_DB;
+	return db;
+}
+
+static float freq_at_point(int p)
+{
+	double lo = log10((double)SPEC_MIN_HZ);
+	double hi = log10((double)SPEC_MAX_HZ);
+	double t = (double)p / (double)(SPEC_POINTS - 1);
+
+	return (float)pow(10.0, lo + t * (hi - lo));
+}
+
+static void spectro_update(struct spectro_state *sp, const int16_t *samples)
+{
+	float peak = SPEC_MIN_DB;
+
+	for (int i = 0; i < FFT_N; i++) {
+		sp->fft_re[i] = (float)samples[i] * sp->window[i] / 32768.0f;
+		sp->fft_im[i] = 0.0f;
+	}
+	fft_inplace(sp->fft_re, sp->fft_im, FFT_N);
+
+	for (int p = 0; p < SPEC_POINTS; p++) {
+		float freq = freq_at_point(p);
+		float bin_f = freq * (float)FFT_N / (float)MIC_RATE;
+		int b0 = (int)bin_f;
+		float mag, db_new;
+
+		if (b0 < 1)
+			b0 = 1;
+		if (b0 >= FFT_BINS - 1)
+			b0 = FFT_BINS - 2;
+		{
+			float frac = bin_f - (float)b0;
+			float mag0 = hypotf(sp->fft_re[b0], sp->fft_im[b0]);
+			float mag1 = hypotf(sp->fft_re[b0 + 1], sp->fft_im[b0 + 1]);
+			/* Raw FFT bin magnitude. Scale [-48, 24] dB fits AC200 voice
+			 * without pinning the trace to the top or the X axis. */
+			mag = mag0 + frac * (mag1 - mag0);
+		}
+		db_new = mag_to_db(mag);
+		sp->db[p] = db_new;
+		if (db_new > peak)
+			peak = db_new;
+	}
+	sp->peak_db = peak;
+	sp->have_spectrum = true;
+	sp->dirty = true;
+}
+
+static void spectro_push_sample(struct spectro_state *sp, int16_t sample)
+{
+	sp->hop[sp->hop_fill++] = sample;
+	if (sp->hop_fill < FFT_N)
+		return;
+
+	spectro_update(sp, sp->hop);
+	memmove(sp->hop, sp->hop + FFT_HOP, sizeof(int16_t) * (FFT_N - FFT_HOP));
+	sp->hop_fill = FFT_N - FFT_HOP;
+}
+
+static void mic_close(struct mic_state *mic)
+{
+	if (mic->pcm) {
+		snd_pcm_close(mic->pcm);
+		mic->pcm = NULL;
+	}
+	mic->ok = false;
+}
+
+static int mic_configure_pcm(snd_pcm_t *pcm, unsigned *channels)
+{
+	snd_pcm_hw_params_t *hw;
+	unsigned int rate = MIC_RATE;
+	unsigned int ch = MIC_CHANNELS;
+	int err;
+
+	snd_pcm_hw_params_alloca(&hw);
+	err = snd_pcm_hw_params_any(pcm, hw);
+	if (err < 0)
+		return err;
+	err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+	if (err < 0)
+		return err;
+	err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
+	if (err < 0)
+		return err;
+	err = snd_pcm_hw_params_set_channels(pcm, hw, ch);
+	if (err < 0)
+		return err;
+	err = snd_pcm_hw_params_set_rate_near(pcm, hw, &rate, NULL);
+	if (err < 0)
+		return err;
+	{
+		snd_pcm_uframes_t period = MIC_PERIOD;
+		err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, NULL);
+	}
+	if (err < 0)
+		return err;
+	err = snd_pcm_hw_params(pcm, hw);
+	if (err < 0)
+		return err;
+	err = snd_pcm_prepare(pcm);
+	if (err < 0)
+		return err;
+	*channels = ch;
+	return 0;
+}
+
+static void mic_open(struct app *app)
+{
+	struct mic_state *mic = &app->mic;
+	const char *dev = getenv("INFO_PANEL_ALSA_DEVICE");
+	int err;
+
+	if (!dev || !dev[0])
+		dev = "hw:CARD=ac200audio,DEV=0";
+
+	if (mic->pcm)
+		return;
+	if (monotonic_ms() < mic->next_retry_ms)
+		return;
+
+	err = snd_pcm_open(&mic->pcm, dev, SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK);
+	if (err < 0) {
+		snprintf(mic->status, sizeof(mic->status), "mic: %s", snd_strerror(err));
+		mic->next_retry_ms = monotonic_ms() + MIC_RETRY_MS;
+		return;
+	}
+
+	err = mic_configure_pcm(mic->pcm, &mic->channels);
+	if (err < 0) {
+		snprintf(mic->status, sizeof(mic->status), "mic cfg: %s", snd_strerror(err));
+		mic_close(mic);
+		mic->next_retry_ms = monotonic_ms() + MIC_RETRY_MS;
+		return;
+	}
+
+	mic->ok = true;
+	snprintf(mic->status, sizeof(mic->status), "mic live");
+}
+
+static bool mic_poll(struct app *app)
+{
+	struct mic_state *mic = &app->mic;
+	int16_t buf[MIC_PERIOD * MIC_CHANNELS];
+	snd_pcm_sframes_t n;
+	bool got = false;
+
+	if (!mic->ok) {
+		mic_open(app);
+		return false;
+	}
+
+	for (;;) {
+		n = snd_pcm_readi(mic->pcm, buf, MIC_PERIOD);
+		if (n == -EAGAIN)
+			break;
+		if (n == -EPIPE) {
+			snd_pcm_prepare(mic->pcm);
+			continue;
+		}
+		if (n < 0) {
+			snprintf(mic->status, sizeof(mic->status), "read: %s", snd_strerror((int)n));
+			mic_close(mic);
+			mic->next_retry_ms = monotonic_ms() + MIC_RETRY_MS;
+			break;
+		}
+		got = true;
+		for (snd_pcm_sframes_t i = 0; i < n; i++)
+			spectro_push_sample(&app->spectro, buf[i * mic->channels]);
+	}
+	return got;
+}
+
+static void mic_drain(struct app *app)
+{
+	while (mic_poll(app))
+		;
+}
+
+static double spec_freq_to_x(double freq, double plot_x, double plot_w)
+{
+	double lo = log10((double)SPEC_MIN_HZ);
+	double hi = log10((double)SPEC_MAX_HZ);
+	double t = (log10(freq) - lo) / (hi - lo);
+
+	if (t < 0.0)
+		t = 0.0;
+	if (t > 1.0)
+		t = 1.0;
+	return plot_x + t * plot_w;
+}
+
+static double spec_db_to_y(double db, double plot_y, double plot_h)
+{
+	double t = (db - (double)SPEC_MIN_DB) / ((double)SPEC_MAX_DB - (double)SPEC_MIN_DB);
+
+	if (t < 0.0)
+		t = 0.0;
+	if (t > 1.0)
+		t = 1.0;
+	return plot_y + (1.0 - t) * plot_h;
+}
+
+static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b)
+{
+	const struct spectro_state *sp = &app->spectro;
+	const struct mic_state *mic = &app->mic;
 	const double w = b->width;
 	const double h = b->height;
+	const double info_h = h * INFO_SPLIT;
+	const double margin_l = w * 0.14;
+	const double margin_r = w * 0.04;
+	const double margin_t = h * 0.018;
+	const double margin_b = h * 0.10;
+	const double y0 = info_h + margin_t;
+	const double plot_w = w - margin_l - margin_r;
+	const double plot_h = h - y0 - margin_b;
+	const double plot_x = margin_l;
+	const double plot_y = y0;
+	const double label_size = h * 0.024;
+	const double tick_size = h * 0.020;
+	static const float freq_ticks[] = { 40, 100, 200, 500, 1000, 2000, 5000, 10000 };
+	static const float db_ticks[] = { -48, -36, -24, -12, 0, 12, 24 };
+	char label[32];
+	cairo_text_extents_t ext;
+	int i;
+
+	cairo_set_source_rgb(cr, 0.02, 0.04, 0.08);
+	cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
+	cairo_fill(cr);
+
+	cairo_set_source_rgb(cr, 0.14, 0.20, 0.28);
+	cairo_set_line_width(cr, 1.0);
+	for (i = 0; i < (int)(sizeof(freq_ticks) / sizeof(freq_ticks[0])); i++) {
+		double x = spec_freq_to_x(freq_ticks[i], plot_x, plot_w);
+		cairo_move_to(cr, x, plot_y);
+		cairo_line_to(cr, x, plot_y + plot_h);
+		cairo_stroke(cr);
+	}
+	for (i = 0; i < (int)(sizeof(db_ticks) / sizeof(db_ticks[0])); i++) {
+		double y = spec_db_to_y(db_ticks[i], plot_y, plot_h);
+		cairo_move_to(cr, plot_x, y);
+		cairo_line_to(cr, plot_x + plot_w, y);
+		cairo_stroke(cr);
+	}
+
+	cairo_set_source_rgb(cr, 0.55, 0.65, 0.75);
+	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+	cairo_set_font_size(cr, tick_size);
+	for (i = 0; i < (int)(sizeof(freq_ticks) / sizeof(freq_ticks[0])); i++) {
+		double x = spec_freq_to_x(freq_ticks[i], plot_x, plot_w);
+		if (freq_ticks[i] >= 1000.0f)
+			snprintf(label, sizeof(label), "%.0fk", freq_ticks[i] / 1000.0f);
+		else
+			snprintf(label, sizeof(label), "%.0f", freq_ticks[i]);
+		cairo_move_to(cr, x - tick_size * 0.8, plot_y + plot_h + tick_size * 1.2);
+		cairo_show_text(cr, label);
+	}
+	for (i = 0; i < (int)(sizeof(db_ticks) / sizeof(db_ticks[0])); i++) {
+		double y = spec_db_to_y(db_ticks[i], plot_y, plot_h);
+		snprintf(label, sizeof(label), "%.0f", db_ticks[i]);
+		cairo_text_extents(cr, label, &ext);
+		cairo_move_to(cr, plot_x - 8.0 - ext.width, y + ext.height * 0.35);
+		cairo_show_text(cr, label);
+	}
+
+	cairo_set_font_size(cr, label_size);
+	cairo_move_to(cr, plot_x + plot_w * 0.5 - label_size * 3.0, plot_y + plot_h + margin_b * 0.82);
+	cairo_show_text(cr, "Frequency (Hz)");
+	cairo_move_to(cr, tick_size * 0.4, plot_y - tick_size * 0.6);
+	cairo_show_text(cr, "dB");
+
+	cairo_set_source_rgb(cr, 0.28, 0.38, 0.48);
+	cairo_set_line_width(cr, 1.5);
+	cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
+	cairo_stroke(cr);
+
+	if (sp->have_spectrum) {
+		double base_y = plot_y + plot_h;
+
+		cairo_save(cr);
+		cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
+		cairo_clip(cr);
+		cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+
+		cairo_set_source_rgb(cr, 0.08, 0.22, 0.36);
+		cairo_move_to(cr, spec_freq_to_x(freq_at_point(0), plot_x, plot_w), base_y);
+		for (int p = 0; p < SPEC_POINTS; p++) {
+			double x = spec_freq_to_x(freq_at_point(p), plot_x, plot_w);
+			double y = spec_db_to_y(sp->db[p], plot_y, plot_h);
+			cairo_line_to(cr, x, y);
+		}
+		cairo_line_to(cr, spec_freq_to_x(freq_at_point(SPEC_POINTS - 1), plot_x, plot_w), base_y);
+		cairo_close_path(cr);
+		cairo_fill(cr);
+
+		cairo_set_source_rgb(cr, 0.45, 0.88, 1.0);
+		cairo_set_line_width(cr, 2.5);
+		cairo_move_to(cr, spec_freq_to_x(freq_at_point(0), plot_x, plot_w),
+			      spec_db_to_y(sp->db[0], plot_y, plot_h));
+		for (int p = 1; p < SPEC_POINTS; p++) {
+			double x = spec_freq_to_x(freq_at_point(p), plot_x, plot_w);
+			double y = spec_db_to_y(sp->db[p], plot_y, plot_h);
+			cairo_line_to(cr, x, y);
+		}
+		cairo_stroke(cr);
+		cairo_restore(cr);
+	}
+
+	cairo_set_source_rgb(cr, 0.55, 0.65, 0.75);
+	cairo_set_font_size(cr, h * 0.028);
+	cairo_move_to(cr, plot_x, info_h + h * 0.004);
+	cairo_show_text(cr, "Microphone spectrum (live)");
+
+	cairo_set_font_size(cr, h * 0.022);
+	cairo_move_to(cr, plot_x, h - h * 0.012);
+	if (mic->ok && sp->have_spectrum) {
+		snprintf(label, sizeof(label), "%s  peak %.0f dB", mic->status, sp->peak_db);
+		cairo_show_text(cr, label);
+	} else if (mic->ok) {
+		cairo_show_text(cr, mic->status);
+	} else {
+		cairo_show_text(cr, mic->status[0] ? mic->status : "mic: waiting...");
+	}
+}
+
+static void draw_stats(struct app *app, cairo_t *cr, double w, double h)
+{
+	const struct panel_metrics *m = &app->metrics;
+	const double info_h = h * INFO_SPLIT;
 	char line[128];
 	time_t now = time(NULL);
 	struct tm tm_now;
@@ -550,21 +979,12 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	char timestr[64];
 	strftime(timestr, sizeof(timestr), "%Y-%m-%d  %H:%M:%S", &tm_now);
 
-	/* Background */
-	cairo_set_source_rgb(cr, 0.04, 0.07, 0.12);
-	cairo_paint(cr);
-
-	/* Accent bar */
-	cairo_set_source_rgb(cr, 0.20, 0.55, 0.85);
-	cairo_rectangle(cr, 0, 0, w, h * 0.01);
-	cairo_fill(cr);
-
-	double title_size = h * 0.07;
-	double body_size = h * 0.048;
-	double small_size = h * 0.032;
+	double title_size = info_h * 0.09;
+	double body_size = info_h * 0.062;
+	double small_size = info_h * 0.042;
 	double x = w * 0.08;
-	double y = h * 0.15;
-	double row = body_size * 1.28;
+	double y = info_h * 0.14;
+	double row = body_size * 1.22;
 
 	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
 	cairo_set_font_size(cr, title_size);
@@ -629,10 +1049,9 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, line);
 
-	/* Memory bar */
 	y += body_size * 0.5;
 	double bar_w = w * 0.70;
-	double bar_h = h * 0.016;
+	double bar_h = info_h * 0.022;
 	cairo_set_source_rgb(cr, 0.12, 0.18, 0.28);
 	cairo_rectangle(cr, x, y, bar_w, bar_h);
 	cairo_fill(cr);
@@ -678,26 +1097,61 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_set_source_rgb(cr, 0.40, 0.50, 0.60);
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, "Wayland / Weston  ·  GPU Mali (Lima)");
+}
+
+static void draw_panel(struct app *app, struct shm_buffer *b, bool full)
+{
+	cairo_surface_t *cs = cairo_image_surface_create_for_data(
+		b->data, CAIRO_FORMAT_ARGB32, b->width, b->height, b->width * 4);
+	cairo_t *cr = cairo_create(cs);
+	const double w = b->width;
+	const double h = b->height;
+	const double info_h = h * INFO_SPLIT;
+
+	if (full) {
+		cairo_set_source_rgb(cr, 0.04, 0.07, 0.12);
+		cairo_paint(cr);
+
+		cairo_set_source_rgb(cr, 0.20, 0.55, 0.85);
+		cairo_rectangle(cr, 0, 0, w, h * 0.01);
+		cairo_fill(cr);
+
+		draw_stats(app, cr, w, h);
+
+		cairo_set_source_rgb(cr, 0.18, 0.28, 0.38);
+		cairo_rectangle(cr, 0, info_h, w, h * 0.004);
+		cairo_fill(cr);
+	} else {
+		cairo_set_source_rgb(cr, 0.04, 0.07, 0.12);
+		cairo_rectangle(cr, 0, info_h, w, h - info_h);
+		cairo_fill(cr);
+	}
+
+	draw_spectrogram(app, cr, b);
 
 	cairo_destroy(cr);
 	cairo_surface_destroy(cs);
 }
 
-static struct shm_buffer *pick_buffer(struct app *app)
+static struct shm_buffer *pick_buffer(struct app *app, bool force)
 {
+	struct shm_buffer *fallback = NULL;
+
 	for (int i = 0; i < 2; i++) {
 		struct shm_buffer *b = &app->buffers[app->buffer_idx];
 		app->buffer_idx = (app->buffer_idx + 1) % 2;
 		if (!b->busy)
 			return b;
+		fallback = b;
 	}
-	return NULL;
+	return force ? fallback : NULL;
 }
 
-static void render(struct app *app)
+static bool render(struct app *app, bool force_buffer, bool full)
 {
 	int width = app->output_width > 0 ? app->output_width : 1280;
 	int height = app->output_height > 0 ? app->output_height : 720;
+	int32_t spec_y;
 
 	for (int i = 0; i < 2; i++) {
 		if (app->buffers[i].wl_buffer &&
@@ -708,23 +1162,32 @@ static void render(struct app *app)
 			if (shm_buffer_init(app, &app->buffers[i], width, height) < 0) {
 				fprintf(stderr, "shm buffer init failed\n");
 				app->running = false;
-				return;
+				return false;
 			}
 		}
 	}
 
-	struct shm_buffer *b = pick_buffer(app);
+	struct shm_buffer *b = pick_buffer(app, force_buffer);
 	if (!b)
-		return;
+		return false;
 
-	metrics_refresh(&app->metrics);
-	draw_panel(app, b);
+	if (!full && !b->stats_valid)
+		full = true;
+
+	draw_panel(app, b, full);
 	b->busy = true;
+	if (full)
+		b->stats_valid = true;
 
+	spec_y = (int32_t)(height * INFO_SPLIT);
 	wl_surface_set_buffer_scale(app->surface, app->scale > 0 ? app->scale : 1);
 	wl_surface_attach(app->surface, b->wl_buffer, 0, 0);
-	wl_surface_damage_buffer(app->surface, 0, 0, width, height);
+	if (full)
+		wl_surface_damage_buffer(app->surface, 0, 0, width, height);
+	else
+		wl_surface_damage_buffer(app->surface, 0, spec_y, width, height - spec_y);
 	wl_surface_commit(app->surface);
+	return true;
 }
 
 static void xdg_wm_base_ping(void *data, struct xdg_wm_base *wm, uint32_t serial)
@@ -742,7 +1205,8 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, u
 	struct app *app = data;
 	xdg_surface_ack_configure(xdg_surface, serial);
 	app->configured = true;
-	render(app);
+	metrics_refresh(&app->metrics);
+	render(app, false, true);
 }
 
 static const struct xdg_surface_listener xdg_surface_listener = {
@@ -855,7 +1319,8 @@ int main(int argc, char **argv)
 	app.scale = 1;
 	app.output_width = 1280;
 	app.output_height = 720;
-
+	snprintf(app.mic.status, sizeof(app.mic.status), "mic: starting");
+	spectro_init(&app.spectro);
 	app.display = wl_display_connect(NULL);
 	if (!app.display) {
 		fprintf(stderr, "failed to connect to Wayland display\n");
@@ -882,17 +1347,28 @@ int main(int argc, char **argv)
 	xdg_toplevel_set_fullscreen(app.xdg_toplevel, app.output);
 	wl_surface_commit(app.surface);
 
-	struct pollfd fds[1];
-	fds[0].fd = wl_display_get_fd(app.display);
-	fds[0].events = POLLIN;
+	struct pollfd pfds[MAX_POLL_FDS];
+	int npoll;
 
-	uint64_t last_ms = 0;
+	uint64_t last_metrics_ms = 0;
 	while (app.running) {
 		while (wl_display_prepare_read(app.display) != 0)
 			wl_display_dispatch_pending(app.display);
 		wl_display_flush(app.display);
 
-		int ret = poll(fds, 1, 50);
+		npoll = 0;
+		pfds[npoll].fd = wl_display_get_fd(app.display);
+		pfds[npoll].events = POLLIN;
+		npoll++;
+		if (app.mic.ok && app.mic.pcm) {
+			unsigned alsa_count = snd_pcm_poll_descriptors_count(app.mic.pcm);
+			if (alsa_count > 0 && npoll + (int)alsa_count <= MAX_POLL_FDS) {
+				snd_pcm_poll_descriptors(app.mic.pcm, pfds + npoll, alsa_count);
+				npoll += (int)alsa_count;
+			}
+		}
+
+		int ret = poll(pfds, (nfds_t)npoll, app.configured ? 0 : 20);
 		if (ret < 0 && errno != EINTR) {
 			wl_display_cancel_read(app.display);
 			break;
@@ -904,17 +1380,25 @@ int main(int argc, char **argv)
 
 		wl_display_dispatch_pending(app.display);
 
-		struct timespec ts;
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL +
-				  (uint64_t)ts.tv_nsec / 1000000ULL;
-		/* ~1 Hz panel refresh. */
-		if (app.configured && (now_ms - last_ms) >= 1000) {
-			last_ms = now_ms;
-			render(&app);
+		if (app.configured)
+			mic_drain(&app);
+
+		uint64_t now_ms = monotonic_ms();
+		bool metrics_due = app.configured && (now_ms - last_metrics_ms) >= 1000;
+
+		if (metrics_due) {
+			last_metrics_ms = now_ms;
+			metrics_refresh(&app.metrics);
+			/* Force a buffer: spectrum updates keep both shm buffers busy. */
+			if (render(&app, true, true))
+				app.spectro.dirty = false;
+		} else if (app.configured && app.spectro.dirty) {
+			if (render(&app, true, false))
+				app.spectro.dirty = false;
 		}
 	}
 
+	mic_close(&app.mic);
 	for (int i = 0; i < 2; i++)
 		shm_buffer_destroy(&app.buffers[i]);
 	if (app.xdg_toplevel)

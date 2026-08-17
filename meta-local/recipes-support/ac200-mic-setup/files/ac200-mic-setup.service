@@ -1,0 +1,12 @@
+[Unit]
+Description=Configure AC200 onboard microphone mixer
+After=local-fs.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ac200-mic-setup.sh
+
+[Install]
+WantedBy=multi-user.target

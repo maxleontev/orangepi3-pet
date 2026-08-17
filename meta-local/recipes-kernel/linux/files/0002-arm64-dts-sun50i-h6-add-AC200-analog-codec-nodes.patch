@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Date: Thu, 1 Sep 2022 17:45:03 +0200
+Subject: [PATCH] arm64: dts: allwinner: h6: add AC200 analog codec nodes
+
+The H6 packages an X-Powers AC200 companion with analog codec, clocked
+from PWM1 and controlled over I2C3 / I2S3. Keep the nodes disabled;
+boards that use the onboard microphone or 3.5 mm jack enable them.
+
+Based on Armbian/Jernej AC200 DTS work.
+
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+---
+ arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi | 118 +++++++++++++++++++
+ 1 file changed, 118 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
+index 111111111111..222222222222 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h6.dtsi
+@@ -16,6 +16,32 @@
+ 	#address-cells = <1>;
+ 	#size-cells = <1>;
+ 
++	analog: analog-codec {
++		compatible = "simple-audio-card";
++		simple-audio-card,format = "i2s";
++		simple-audio-card,name = "ac200-audio";
++		simple-audio-card,mclk-fs = <512>;
++		status = "disabled";
++
++		simple-audio-card,cpu {
++			sound-dai = <&i2s3>;
++		};
++
++		simple-audio-card,codec {
++			sound-dai = <&ac200_codec>;
++		};
++	};
++
++	ac200_pwm_clk: ac200_clk {
++		compatible = "pwm-clock";
++		#clock-cells = <0>;
++		clock-frequency = <24000000>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pwm1_pin>;
++		pwms = <&pwm 1 42 0>;
++		status = "disabled";
++	};
++
+ 	cpus {
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+@@ -335,6 +367,14 @@
+ 			cpu_speed_grade: cpu-speed-grade@1c {
+ 				reg = <0x1c 0x4>;
+ 			};
++
++			ephy_calib: ephy_calib@2c {
++				reg = <0x2c 0x2>;
++			};
++
++			ac200_bg: ac200_bg@30 {
++				reg = <0x30 0x2>;
++			};
+ 		};
+ 
+ 		timer@3009000 {
+@@ -410,6 +450,17 @@
+ 				function = "i2c2";
+ 			};
+ 
++			i2c3_pins: i2c3-pins {
++				pins = "PB17", "PB18";
++				function = "i2c3";
++				bias-pull-up;
++			};
++
++			i2s3_pins: i2s3-pins {
++				pins = "PB12", "PB13", "PB14", "PB15", "PB16";
++				function = "i2s3";
++			};
++
+ 			mmc0_pins: mmc0-pins {
+ 				pins = "PF0", "PF1", "PF2", "PF3",
+ 				       "PF4", "PF5";
+@@ -437,6 +487,11 @@
+ 				bias-pull-up;
+ 			};
+ 
++			pwm1_pin: pwm1-pin {
++				pins = "PB19";
++				function = "pwm1";
++			};
++
+ 			/omit-if-no-ref/
+ 			spi0_pins: spi0-pins {
+ 				pins = "PC0", "PC2", "PC3";
+@@ -649,6 +704,35 @@
+ 			#size-cells = <0>;
+ 		};
+ 
++		i2c3: i2c@5002c00 {
++			compatible = "allwinner,sun50i-h6-i2c",
++				     "allwinner,sun6i-a31-i2c";
++			reg = <0x05002c00 0x400>;
++			interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2C3>;
++			resets = <&ccu RST_BUS_I2C3>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&i2c3_pins>;
++			clock-frequency = <100000>;
++			status = "disabled";
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			ac200: mfd@10 {
++				compatible = "x-powers,ac200";
++				reg = <0x10>;
++				clocks = <&ac200_pwm_clk>;
++				nvmem-cells = <&ac200_bg>;
++				nvmem-cell-names = "bandgap";
++
++				ac200_codec: codec {
++					#sound-dai-cells = <0>;
++					compatible = "x-powers,ac200-codec";
++					status = "disabled";
++				};
++			};
++		};
++
+ 		spi0: spi@5010000 {
+ 			compatible = "allwinner,sun50i-h6-spi",
+ 				     "allwinner,sun8i-h3-spi";
+@@ -664,6 +756,21 @@
+ 			};
+ 		};
+ 
++		i2s3: i2s@508f000 {
++			#sound-dai-cells = <0>;
++			compatible = "allwinner,sun50i-h6-i2s";
++			reg = <0x0508f000 0x1000>;
++			interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_I2S3>, <&ccu CLK_I2S3>;
++			clock-names = "apb", "mod";
++			dmas = <&dma 6>, <&dma 6>;
++			resets = <&ccu RST_BUS_I2S3>;
++			dma-names = "rx", "tx";
++			pinctrl-names = "default";
++			pinctrl-0 = <&i2s3_pins>;
++			status = "disabled";
++		};
++
+ 		i2s1: i2s@5091000 {
+ 			#sound-dai-cells = <0>;
+ 			compatible = "allwinner,sun50i-h6-i2s";
+-- 
+2.35.3
