@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Date: Thu, 1 Sep 2022 17:49:28 +0200
+Subject: [PATCH] arm64: dts: allwinner: h6: enable AC200 codec on Orange Pi 3
+
+Wire the onboard analog microphone / 3.5 mm path: PWM1 clock for AC200,
+I2C3 + I2S3, ALDO2 analog supply.
+
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+---
+ arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts | 32 +++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts b/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts
+index 111111111111..222222222222 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts
+@@ -104,6 +104,19 @@
+ 	};
+ };
+ 
++&ac200_codec {
++	avcc-supply = <&reg_aldo2>;
++	status = "okay";
++};
++
++&ac200_pwm_clk {
++	status = "okay";
++};
++
++&analog {
++	status = "okay";
++};
++
+ &cpu0 {
+ 	cpu-supply = <&reg_dcdca>;
+ };
+@@ -131,6 +144,14 @@
+ 	};
+ };
+ 
++&i2c3 {
++	status = "okay";
++};
++
++&i2s3 {
++	status = "okay";
++};
++
+ &mmc0 {
+ 	vmmc-supply = <&reg_cldo1>;
+ 	cd-gpios = <&pio 5 6 GPIO_ACTIVE_LOW>; /* PF6 */
+@@ -177,6 +198,10 @@
+ 	vcc-pg-supply = <&reg_vcc_wifi_io>;
+ };
+ 
++&pwm {
++	status = "okay";
++};
++
+ &r_ir {
+ 	status = "okay";
+ };
+@@ -239,4 +264,5 @@
+ 			reg_aldo2: aldo2 {
++				regulator-always-on;
+ 				regulator-min-microvolt = <3300000>;
+ 				regulator-max-microvolt = <3300000>;
+ 				regulator-name = "vcc33-audio-tv-ephy-mac";
+-- 
+2.35.3

@@ -8,6 +8,8 @@ SRC_URI:append = " \
 
 PACKAGECONFIG:append = " no-idle-timeout"
 
+USERADD_PARAM:${PN} = "--home /home/weston --shell /bin/sh --user-group -G video,input,render,wayland weston"
+
 # Start after wifi.service (unit After=). DRM stays blacklisted until
 # weston-prepare-drm modprobes so WiFi can associate first.
 SYSTEMD_AUTO_ENABLE = "enable"

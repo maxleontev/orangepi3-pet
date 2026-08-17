@@ -1,4 +1,4 @@
-SUMMARY = "Fullscreen HDMI info panel (CPU temp/usage, memory, IP, WiFi) for Weston"
+SUMMARY = "Fullscreen HDMI info panel (CPU, memory, IP, WiFi) for Weston"
 DESCRIPTION = "Wayland client that renders a real-time system dashboard on \
 the HDMI output (CPU temperature and per-core usage, memory, IP, WiFi SSID). \
 Weston composites via DRM/KMS using Mesa Lima (Mali-T720)."
@@ -12,7 +12,7 @@ SRC_URI = " \
 
 S = "${WORKDIR}/info-panel"
 
-DEPENDS = "wayland wayland-native wayland-protocols cairo"
+DEPENDS = "wayland wayland-native wayland-protocols cairo alsa-lib"
 
 inherit meson pkgconfig systemd features_check
 
@@ -28,4 +28,4 @@ do_install:append() {
 
 FILES:${PN} += "${systemd_system_unitdir}/info-panel.service"
 
-RDEPENDS:${PN} += "weston-init liberation-fonts iw"
+RDEPENDS:${PN} += "weston-init liberation-fonts iw alsa-lib"

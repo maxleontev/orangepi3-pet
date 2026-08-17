@@ -11,6 +11,8 @@ Related config outside this folder (required for a working image):
 | Distro features / Mesa providers | `meta-local/conf/distro/include/orangepi3-graphics.inc` (required from `build-orangepi3/conf/local.conf`) |
 | Machine: `use-mailine-graphics`, OpenGL | `meta-local/conf/machine/orange-pi-3.conf` |
 | Kernel DRM/Lima/THS fragments | `meta-local/recipes-kernel/linux/files/drm.cfg` |
+| Kernel AC200 analog audio | `meta-local/recipes-kernel/linux/files/audio.cfg` + AC200 patches |
+| AC200 mic mixer at boot | `meta-local/recipes-support/ac200-mic-setup/` → Master cap **62%**, MIC1 Boost **4**, ADC Volume **7** |
 | Image packages | `core-image-khepri.bb` → `weston weston-init info-panel kmscube display-rf-blacklist` |
 
 ---
@@ -18,6 +20,8 @@ Related config outside this folder (required for a working image):
 ## What you see on HDMI
 
 After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client draws:
+
+**Top ~56%**
 
 - Hostname and local time  
 - **CPU temperature** (°C) from `/sys/class/thermal` (prefer `cpu-thermal`) or hwmon  
@@ -27,7 +31,15 @@ After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client dra
 - **WiFi SSID** via `/usr/sbin/iw dev wlan0 link`  
 - Footer: Wayland/Weston · Mali (Lima)
 
-Refresh rate: **4 Hz** (250 ms).
+**Bottom ~44%**
+
+- Live **microphone spectrum** (AC200 analog codec, I2S3)  
+- X axis: **40 Hz – 10 kHz** (log scale); Y axis: **dB** (−48 … 24)  
+- ALSA capture via `hw:CARD=ac200audio`; override with `INFO_PANEL_ALSA_DEVICE`  
+- FFT 512 / hop 256 @ 48 kHz; display refresh up to ~30 Hz  
+- Board metrics still update at **1 Hz**
+
+Refresh rate: **1 Hz**
 
 ---
 

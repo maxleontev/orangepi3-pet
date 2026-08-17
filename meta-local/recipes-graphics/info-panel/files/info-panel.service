@@ -8,7 +8,7 @@ PartOf=weston.service
 Type=simple
 User=weston
 Group=weston
-SupplementaryGroups=wayland
+SupplementaryGroups=wayland audio
 Environment=XDG_RUNTIME_DIR=/run
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
