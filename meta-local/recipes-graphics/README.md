@@ -35,10 +35,8 @@ After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client dra
 - Live **microphone spectrum** (AC200 analog codec, I2S3)  
 - X axis: **40 Hz – 10 kHz** (log scale); Y axis: **dB** (−48 … 24)  
 - ALSA capture via `hw:CARD=ac200audio`; override with `INFO_PANEL_ALSA_DEVICE`  
-- FFT 512 / hop 256 @ 48 kHz; display refresh up to ~30 Hz  
+- FFT 512 / hop 128 @ 48 kHz; spectrum redraw **~5 Hz** (a 0 ms poll + per-hop commits hard-reset the board)  
 - Board metrics still update at **1 Hz**
-
-Refresh rate: **1 Hz**
 
 ---
 
@@ -276,6 +274,6 @@ recipes-graphics/
 ## Limitations
 
 - Enabling HDMI/DRM can still degrade or drop **2.4 GHz** WiFi; **5 GHz** is preferred when in range.  
-- info-panel is a Cairo/shm client (not a GL UI); Lima is mainly for Weston/compositing and tools like kmscube.  
+- info-panel is a Cairo/shm client (not a GL UI). Weston uses **pixman** to composite it; Lima GL compositing of per-hop SHM commits hard-reset the board. kmscube still uses Lima.  
 - Thermal zones require a kernel built with both `SUN8I_THERMAL` and `NVMEM_SUNXI_SID`.  
 - HDMI cable must present a connector (`connected`, or `unknown` after late PHY bind); fully `disconnected` leaves pick-drm failing and Weston restarting.

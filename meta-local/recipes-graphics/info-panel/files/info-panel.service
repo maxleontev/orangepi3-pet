@@ -1,6 +1,7 @@
 [Unit]
 Description=HDMI real-time system info panel
-After=weston.service
+After=weston.service ac200-mic-setup.service
+Wants=ac200-mic-setup.service
 BindsTo=weston.service
 PartOf=weston.service
 

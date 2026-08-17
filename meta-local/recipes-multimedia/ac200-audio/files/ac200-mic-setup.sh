@@ -21,7 +21,8 @@
 # Image must ship alsa-utils-amixer; BusyBox has no amixer.
 set -eu
 
-CARD="${AC200_MIC_CARD:-0}"
+# Prefer the card name: index 0 exists in /proc/asound before amixer can use it.
+CARD="${AC200_MIC_CARD:-ac200audio}"
 MASTER_CAP="${AC200_MIC_MASTER_CAP:-62}"
 MIC_BOOST="${AC200_MIC_BOOST:-4}"
 
@@ -30,7 +31,7 @@ usage() {
 Usage: ${0##*/}
 
 Env:
-  AC200_MIC_CARD       ALSA card index (default: 0)
+  AC200_MIC_CARD       ALSA card name or index (default: ac200audio)
   AC200_MIC_MASTER_CAP Master capture percent 0-100 (default: 62)
   AC200_MIC_BOOST      MIC1 Boost 0-7 (default: 4)
 EOF
@@ -46,14 +47,18 @@ if ! command -v amixer >/dev/null 2>&1; then
 	exit 0
 fi
 
+# /proc/asound/card0 can appear before the mixer is usable ("Invalid card number").
 i=0
-while [ ! -d "/proc/asound/card${CARD}" ] && [ "$i" -lt 50 ]; do
+while [ "$i" -lt 100 ]; do
+	if amixer -c "$CARD" cget name='ADC Volume' >/dev/null 2>&1; then
+		break
+	fi
 	i=$((i + 1))
 	sleep 0.2
 done
-[ -d "/proc/asound/card${CARD}" ] || {
-	echo "ac200-mic-setup: card ${CARD} not found" >&2
-	exit 0
+amixer -c "$CARD" cget name='ADC Volume' >/dev/null 2>&1 || {
+	echo "ac200-mic-setup: card ${CARD} mixer not ready" >&2
+	exit 1
 }
 
 # Full control names from snd-soc-ac200 (sset aliases are ambiguous).

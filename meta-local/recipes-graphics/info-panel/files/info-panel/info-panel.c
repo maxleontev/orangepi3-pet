@@ -15,13 +15,15 @@
  * This process
  *   1. Opens hw:CARD=ac200audio,DEV=0 as non-blocking capture (S16_LE,
  *      stereo, 48 kHz, period 128). Override with INFO_PANEL_ALSA_DEVICE.
- *   2. Polls Wayland + ALSA together (timeout 0 once configured) and drains
- *      every available PCM period.
- *   3. Takes the first interleaved channel, Hann-windows 512-sample frames
- *      with hop 128 (~2.7 ms), FFT, maps bins onto a log 40 Hz..10 kHz
- *      X axis and 20*log10(raw |X[k]|) on Y (−48..+24 dB).
- *   4. Redraws only the bottom ~44% of the SHM buffer for spectrum frames;
- *      full-frame stats redraw once per second.
+ *   2. Polls Wayland + ALSA together with a real timeout (next 5 Hz frame
+ *      or 1 Hz stats, at least 10 ms) and drains every available PCM period.
+ *   3. Takes the first interleaved channel into a rolling Hann window of
+ *      512 samples (hop 128). FFT runs only when a display frame is due,
+ *      then bins are mapped onto log 40 Hz..10 kHz X and 20*log10(raw
+ *      |X[k]|) on Y (−48..+24 dB).
+ *   4. Redraws only the bottom ~44% of the SHM buffer for spectrum frames
+ *      at ~5 Hz; full-frame stats redraw once per second. Never attach a
+ *      wl_shm buffer the compositor has not released.
  *
  * Problems found on this board and how they are handled
  *
@@ -50,9 +52,9 @@
  *     (2) 33 ms cap + exponential smoothing hid transients.
  *     (3) poll() waited on Wayland only, so ALSA data sat until the next
  *         timeout; each frame also redrew the whole stats pane.
- *     Fix: never drop dirty until a successful commit; force-pick a buffer;
- *     poll ALSA fds with timeout 0; hop 128; drain the PCM; damage only the
- *     spectrum region; no smoothing.
+ *     Fix: never drop dirty until a successful commit; poll ALSA fds;
+ *     hop 128; drain the PCM; damage only the spectrum region; no smoothing.
+ *     Do not force-attach a busy buffer or poll with timeout 0 (see below).
  *
  *   Voice pinned the trace to the ceiling, then a "correct" FFT scale
  *   made only the axes visible
@@ -66,8 +68,19 @@
  *   Stats pane updated about once a minute
  *     Spectrum frames used force=true; the 1 Hz stats path used force=false
  *     and lost every attempt while both buffers were busy. Metrics changed
- *     in memory but the top of the screen did not. Fix: stats render also
- *     force-picks a buffer.
+ *     in memory but the top of the screen did not. With spectrum capped at
+ *     5 Hz the compositor releases a buffer in time, so 1 Hz stats can
+ *     wait instead of stealing a busy buffer.
+ *
+ *   Board hard-reset every ~4–5 minutes after the live spectrum landed
+ *     poll(..., 0) plus force-pick of busy wl_shm buffers committed Cairo
+ *     frames hundreds of times per second. HDMI showed one core at 99%,
+ *     weston stayed Runnable, temperature was only ~52 °C, memory was
+ *     fine, and dmesg had no oops (panic=10 would have logged one). The
+ *     SoC then reset (unclean FAT on /boot). Fix: 5 Hz cap, poll never
+ *     shorter than 10 ms, ignore ALSA POLLOUT (it kept poll() from sleeping),
+ *     FFT only on display ticks, stroke-only trace (no filled path), axes
+ *     only on the 1 Hz full frame, never attach a buffer still held by Weston.
  */
 
 #define _GNU_SOURCE
@@ -112,6 +125,9 @@
 /* See file header: −6 dB ceiling pegged speech; /N hid the trace on the axis. */
 #define SPEC_MIN_DB -48.0f
 #define SPEC_MAX_DB 24.0f
+/* Display cap. Timeout 0 + per-hop commits reset the H6 every few minutes. */
+#define SPEC_FRAME_MS 200
+#define POLL_MIN_MS 10
 #define MAX_POLL_FDS 8
 
 struct panel_metrics {
@@ -152,6 +168,7 @@ struct mic_state {
 
 struct spectro_state {
 	int16_t hop[FFT_N];
+	int16_t latest[FFT_N];
 	unsigned hop_fill;
 	float window[FFT_N];
 	float fft_re[FFT_N];
@@ -159,6 +176,7 @@ struct spectro_state {
 	float db[SPEC_POINTS];
 	float peak_db;
 	bool have_spectrum;
+	bool window_ready;
 	bool dirty;
 };
 
@@ -769,9 +787,19 @@ static void spectro_push_sample(struct spectro_state *sp, int16_t sample)
 	if (sp->hop_fill < FFT_N)
 		return;
 
-	spectro_update(sp, sp->hop);
+	/* Keep the newest window; FFT waits for the 20 Hz display tick. */
+	memcpy(sp->latest, sp->hop, sizeof(sp->latest));
 	memmove(sp->hop, sp->hop + FFT_HOP, sizeof(int16_t) * (FFT_N - FFT_HOP));
 	sp->hop_fill = FFT_N - FFT_HOP;
+	sp->window_ready = true;
+}
+
+static void spectro_refresh_if_ready(struct spectro_state *sp)
+{
+	if (!sp->window_ready)
+		return;
+	spectro_update(sp, sp->latest);
+	sp->window_ready = false;
 }
 
 static void mic_close(struct mic_state *mic)
@@ -920,45 +948,67 @@ static double spec_db_to_y(double db, double plot_y, double plot_h)
 	return plot_y + (1.0 - t) * plot_h;
 }
 
-static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b)
+static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b,
+			     bool axes)
 {
 	const struct spectro_state *sp = &app->spectro;
 	const struct mic_state *mic = &app->mic;
 	const double w = b->width;
 	const double h = b->height;
 	const double info_h = h * INFO_SPLIT;
-	/* 14% left margin: rotated "dB" used to sit on the numeric ticks. */
-	const double margin_l = w * 0.14;
-	const double margin_r = w * 0.04;
-	const double margin_t = h * 0.018;
-	const double margin_b = h * 0.10;
+	const double label_size = h * 0.020;
+	const double tick_size = h * 0.016;
+	const double edge = label_size * 1.6;
+	const double db_w = label_size * 1.55;
+	const double num_col_w = tick_size * 3.5;
+	const double margin_l = edge + db_w + 4.0 + num_col_w + 6.0;
+	const double margin_r = edge + tick_size * 2.0;
+	const double margin_t = tick_size + 18.0;
+	const double margin_b = tick_size + 4.0 + 6.0 + label_size + edge;
 	const double y0 = info_h + margin_t;
-	const double plot_w = w - margin_l - margin_r;
-	const double plot_h = h - y0 - margin_b;
-	const double plot_x = margin_l;
-	const double plot_y = y0;
-	const double label_size = h * 0.024;
-	const double tick_size = h * 0.020;
-	static const float freq_ticks[] = { 40, 100, 200, 500, 1000, 2000, 5000, 10000 };
+	/* Integer pixels: a 1.5px stroke on a fractional y shimmered with the 24 dB grid. */
+	const double plot_x = (double)(int)(margin_l + 0.5);
+	const double plot_y = (double)(int)(y0 + 0.5);
+	const double plot_w = (double)(int)(w - plot_x - margin_r + 0.5);
+	const double plot_h = (double)(int)(h - plot_y - margin_b + 0.5);
+	static const float freq_ticks[] = { 40, 100, 200, 500, 1000, 2000, 5000 };
 	static const float db_ticks[] = { -48, -36, -24, -12, 0, 12, 24 };
 	char label[32];
-	cairo_text_extents_t ext;
+	double tick_baseline;
+	double freq_baseline;
 	int i;
+
+	(void)axes;
+
+	cairo_set_source_rgb(cr, 0.04, 0.07, 0.12);
+	cairo_rectangle(cr, 0.0, info_h + 4.0, plot_x, h - (info_h + 4.0));
+	cairo_fill(cr);
+	cairo_rectangle(cr, 0.0, plot_y + plot_h, w, h - (plot_y + plot_h));
+	cairo_fill(cr);
+	/* Top strip above the frame — stop 1px short so the 1px stroke is not erased. */
+	if (plot_y - 1.0 > info_h + 4.0)
+		cairo_rectangle(cr, plot_x, info_h + 4.0, plot_w, plot_y - 1.0 - (info_h + 4.0));
+	cairo_fill(cr);
 
 	cairo_set_source_rgb(cr, 0.02, 0.04, 0.08);
 	cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
 	cairo_fill(cr);
 
+	/* Grid every frame: the fill above erases it on 5 Hz updates. */
 	cairo_set_source_rgb(cr, 0.14, 0.20, 0.28);
 	cairo_set_line_width(cr, 1.0);
 	for (i = 0; i < (int)(sizeof(freq_ticks) / sizeof(freq_ticks[0])); i++) {
 		double x = spec_freq_to_x(freq_ticks[i], plot_x, plot_w);
-		cairo_move_to(cr, x, plot_y);
-		cairo_line_to(cr, x, plot_y + plot_h);
+		cairo_move_to(cr, x, plot_y + 1.0);
+		cairo_line_to(cr, x, plot_y + plot_h - 1.0);
 		cairo_stroke(cr);
 	}
 	for (i = 0; i < (int)(sizeof(db_ticks) / sizeof(db_ticks[0])); i++) {
 		double y = spec_db_to_y(db_ticks[i], plot_y, plot_h);
+
+		/* 24 / −48 sit on the frame; a second stroke there made the top edge flicker. */
+		if (db_ticks[i] >= 24.0f || db_ticks[i] <= -48.0f)
+			continue;
 		cairo_move_to(cr, plot_x, y);
 		cairo_line_to(cr, plot_x + plot_w, y);
 		cairo_stroke(cr);
@@ -966,58 +1016,70 @@ static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b)
 
 	cairo_set_source_rgb(cr, 0.55, 0.65, 0.75);
 	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+	tick_baseline = plot_y + plot_h + tick_size + 4.0;
+	freq_baseline = h - edge;
 	cairo_set_font_size(cr, tick_size);
 	for (i = 0; i < (int)(sizeof(freq_ticks) / sizeof(freq_ticks[0])); i++) {
 		double x = spec_freq_to_x(freq_ticks[i], plot_x, plot_w);
+		double tw;
+		double tx;
+
+		/* Skip 40 Hz: it collides with -48 dB at the origin. */
+		if (freq_ticks[i] <= 40.0f)
+			continue;
 		if (freq_ticks[i] >= 1000.0f)
 			snprintf(label, sizeof(label), "%.0fk", freq_ticks[i] / 1000.0f);
 		else
 			snprintf(label, sizeof(label), "%.0f", freq_ticks[i]);
-		cairo_move_to(cr, x - tick_size * 0.8, plot_y + plot_h + tick_size * 1.2);
+		tw = tick_size * (double)strlen(label) * 0.70;
+		tx = x - tw * 0.5;
+		if (tx < edge)
+			tx = edge;
+		if (tx + tw > w - edge)
+			tx = w - edge - tw;
+		cairo_move_to(cr, tx, tick_baseline);
 		cairo_show_text(cr, label);
 	}
 	for (i = 0; i < (int)(sizeof(db_ticks) / sizeof(db_ticks[0])); i++) {
 		double y = spec_db_to_y(db_ticks[i], plot_y, plot_h);
+		double baseline = y + tick_size * 0.35;
+		double tw = 0.0;
+		size_t c;
+
+		/* "24" would otherwise straddle the top stroke (same flicker as "dB"). */
+		if (db_ticks[i] >= 24.0f)
+			baseline = plot_y + tick_size;
 		snprintf(label, sizeof(label), "%.0f", db_ticks[i]);
-		cairo_text_extents(cr, label, &ext);
-		cairo_move_to(cr, plot_x - 8.0 - ext.width, y + ext.height * 0.35);
+		/* cairo_text_extents is unusable on this image; size per glyph. */
+		for (c = 0; label[c]; c++)
+			tw += (label[c] == '-') ? tick_size * 0.40 : tick_size * 0.58;
+		cairo_move_to(cr, plot_x - 3.0 - tw, baseline);
 		cairo_show_text(cr, label);
 	}
 
 	cairo_set_font_size(cr, label_size);
-	cairo_move_to(cr, plot_x + plot_w * 0.5 - label_size * 3.0, plot_y + plot_h + margin_b * 0.82);
-	cairo_show_text(cr, "Frequency (Hz)");
-	/* Horizontal title: a vertical "dB" next to the ticks overlapped them. */
-	cairo_move_to(cr, tick_size * 0.4, plot_y - tick_size * 0.6);
+	{
+		const char *freq_title = "Frequency (Hz)";
+		double title_w = label_size * (double)strlen(freq_title) * 0.55;
+
+		cairo_move_to(cr, plot_x + (plot_w - title_w) * 0.5, freq_baseline);
+		cairo_show_text(cr, freq_title);
+	}
+	/*
+	 * Toy-font ascent can exceed font_size. Keep the cap ≥6px below the
+	 * 1px top stroke so "dB" does not share AA pixels with the frame.
+	 */
+	cairo_move_to(cr, edge, plot_y + 6.0 + label_size * 1.15);
 	cairo_show_text(cr, "dB");
 
-	cairo_set_source_rgb(cr, 0.28, 0.38, 0.48);
-	cairo_set_line_width(cr, 1.5);
-	cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
-	cairo_stroke(cr);
-
 	if (sp->have_spectrum) {
-		double base_y = plot_y + plot_h;
-
-		/* Opaque SOURCE: rgba 0.22 fills disappeared on wl_shm (premult). */
 		cairo_save(cr);
-		cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
+		/* Inset so a 2px trace at +24 dB cannot chew the top stroke. */
+		cairo_rectangle(cr, plot_x + 1.0, plot_y + 2.0, plot_w - 2.0, plot_h - 3.0);
 		cairo_clip(cr);
-		cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-
-		cairo_set_source_rgb(cr, 0.08, 0.22, 0.36);
-		cairo_move_to(cr, spec_freq_to_x(freq_at_point(0), plot_x, plot_w), base_y);
-		for (int p = 0; p < SPEC_POINTS; p++) {
-			double x = spec_freq_to_x(freq_at_point(p), plot_x, plot_w);
-			double y = spec_db_to_y(sp->db[p], plot_y, plot_h);
-			cairo_line_to(cr, x, y);
-		}
-		cairo_line_to(cr, spec_freq_to_x(freq_at_point(SPEC_POINTS - 1), plot_x, plot_w), base_y);
-		cairo_close_path(cr);
-		cairo_fill(cr);
-
+		cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
 		cairo_set_source_rgb(cr, 0.45, 0.88, 1.0);
-		cairo_set_line_width(cr, 2.5);
+		cairo_set_line_width(cr, 2.0);
 		cairo_move_to(cr, spec_freq_to_x(freq_at_point(0), plot_x, plot_w),
 			      spec_db_to_y(sp->db[0], plot_y, plot_h));
 		for (int p = 1; p < SPEC_POINTS; p++) {
@@ -1029,21 +1091,48 @@ static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b)
 		cairo_restore(cr);
 	}
 
-	cairo_set_source_rgb(cr, 0.55, 0.65, 0.75);
-	cairo_set_font_size(cr, h * 0.028);
-	cairo_move_to(cr, plot_x, info_h + h * 0.004);
-	cairo_show_text(cr, "Microphone spectrum (live)");
+	cairo_select_font_face(cr, "sans-serif", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+	cairo_set_font_size(cr, tick_size);
+	{
+		/* "peak" and "dB" stay put; only the digits move inside a fixed slot. */
+		const double ch = tick_size * 0.58;
+		const double peak_word_w = tick_size * 4.0 * 0.62;
+		const double num_slot_w = ch * 5.0;
+		const double db_word_w = tick_size * 2.0 * 0.62;
+		const double gap = tick_size * 0.40;
+		double px = plot_x + plot_w - 10.0 -
+			    (peak_word_w + gap + num_slot_w + gap + db_word_w);
+		double py = plot_y - 8.0;
 
-	cairo_set_font_size(cr, h * 0.022);
-	cairo_move_to(cr, plot_x, h - h * 0.012);
-	if (mic->ok && sp->have_spectrum) {
-		snprintf(label, sizeof(label), "%s  peak %.0f dB", mic->status, sp->peak_db);
-		cairo_show_text(cr, label);
-	} else if (mic->ok) {
-		cairo_show_text(cr, mic->status);
-	} else {
-		cairo_show_text(cr, mic->status[0] ? mic->status : "mic: waiting...");
+		if (px < plot_x + 8.0)
+			px = plot_x + 8.0;
+		if (py < info_h + tick_size)
+			py = info_h + tick_size;
+		cairo_set_source_rgb(cr, 0.70, 0.80, 0.88);
+		if (mic->ok && sp->have_spectrum) {
+			char num[16];
+			double tw = 0.0;
+			size_t c;
+
+			cairo_move_to(cr, px, py);
+			cairo_show_text(cr, "peak");
+			snprintf(num, sizeof(num), "%.0f", sp->peak_db);
+			for (c = 0; num[c]; c++)
+				tw += (num[c] == '-') ? tick_size * 0.40 : ch;
+			cairo_move_to(cr, px + peak_word_w + gap + num_slot_w - tw, py);
+			cairo_show_text(cr, num);
+			cairo_move_to(cr, px + peak_word_w + gap + num_slot_w + gap, py);
+			cairo_show_text(cr, "dB");
+		} else {
+			cairo_move_to(cr, px, py);
+			cairo_show_text(cr, mic->status[0] ? mic->status : "mic: waiting...");
+		}
 	}
+
+	cairo_set_source_rgb(cr, 0.28, 0.38, 0.48);
+	cairo_set_line_width(cr, 1.0);
+	cairo_rectangle(cr, plot_x + 0.5, plot_y + 0.5, plot_w - 1.0, plot_h - 1.0);
+	cairo_stroke(cr);
 }
 
 static void draw_stats(struct app *app, cairo_t *cr, double w, double h)
@@ -1170,11 +1259,13 @@ static void draw_stats(struct app *app, cairo_t *cr, double w, double h)
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, line);
 
-	y += body_size * 1.35;
-	cairo_set_font_size(cr, small_size);
-	cairo_set_source_rgb(cr, 0.40, 0.50, 0.60);
-	cairo_move_to(cr, x, y);
-	cairo_show_text(cr, "Wayland / Weston  ·  GPU Mali (Lima)");
+	y += body_size * 1.15;
+	if (y < info_h - small_size * 0.4) {
+		cairo_set_font_size(cr, small_size);
+		cairo_set_source_rgb(cr, 0.40, 0.50, 0.60);
+		cairo_move_to(cr, x, y);
+		cairo_show_text(cr, "Wayland / Weston  ·  GPU Mali (Lima)");
+	}
 }
 
 static void draw_panel(struct app *app, struct shm_buffer *b, bool full)
@@ -1199,19 +1290,15 @@ static void draw_panel(struct app *app, struct shm_buffer *b, bool full)
 		cairo_set_source_rgb(cr, 0.18, 0.28, 0.38);
 		cairo_rectangle(cr, 0, info_h, w, h * 0.004);
 		cairo_fill(cr);
-	} else {
-		cairo_set_source_rgb(cr, 0.04, 0.07, 0.12);
-		cairo_rectangle(cr, 0, info_h, w, h - info_h);
-		cairo_fill(cr);
 	}
 
-	draw_spectrogram(app, cr, b);
+	draw_spectrogram(app, cr, b, full);
 
 	cairo_destroy(cr);
 	cairo_surface_destroy(cs);
 }
 
-/* force: reuse a busy buffer rather than skip the frame (was freezing the plot). */
+/* Wait for wl_buffer.release. Attaching a busy buffer reset this H6. */
 static struct shm_buffer *pick_buffer(struct app *app, bool force)
 {
 	struct shm_buffer *fallback = NULL;
@@ -1267,6 +1354,27 @@ static bool render(struct app *app, bool force_buffer, bool full)
 		wl_surface_damage_buffer(app->surface, 0, spec_y, width, height - spec_y);
 	wl_surface_commit(app->surface);
 	return true;
+}
+
+static int loop_timeout_ms(bool configured, uint64_t now_ms,
+			   uint64_t last_spec_ms, uint64_t last_metrics_ms)
+{
+	uint64_t next_spec;
+	uint64_t next_metrics;
+	uint64_t next;
+	int wait;
+
+	if (!configured)
+		return 20;
+	next_spec = last_spec_ms + SPEC_FRAME_MS;
+	next_metrics = last_metrics_ms + 1000;
+	next = next_spec < next_metrics ? next_spec : next_metrics;
+	if (next <= now_ms)
+		return POLL_MIN_MS;
+	if (next - now_ms > 1000)
+		return SPEC_FRAME_MS;
+	wait = (int)(next - now_ms);
+	return wait < POLL_MIN_MS ? POLL_MIN_MS : wait;
 }
 
 static void xdg_wm_base_ping(void *data, struct xdg_wm_base *wm, uint32_t serial)
@@ -1430,25 +1538,25 @@ int main(int argc, char **argv)
 	int npoll;
 
 	uint64_t last_metrics_ms = 0;
+	uint64_t last_spec_ms = 0;
 	while (app.running) {
+		uint64_t now_ms;
+
 		while (wl_display_prepare_read(app.display) != 0)
 			wl_display_dispatch_pending(app.display);
 		wl_display_flush(app.display);
 
-		/* Wayland + ALSA in one poll; timeout 0 once the surface exists. */
+		now_ms = monotonic_ms();
 		npoll = 0;
 		pfds[npoll].fd = wl_display_get_fd(app.display);
 		pfds[npoll].events = POLLIN;
 		npoll++;
-		if (app.mic.ok && app.mic.pcm) {
-			unsigned alsa_count = snd_pcm_poll_descriptors_count(app.mic.pcm);
-			if (alsa_count > 0 && npoll + (int)alsa_count <= MAX_POLL_FDS) {
-				snd_pcm_poll_descriptors(app.mic.pcm, pfds + npoll, alsa_count);
-				npoll += (int)alsa_count;
-			}
-		}
+		/* Do not poll ALSA: capture fds stay POLLOUT/POLLIN and poll() never
+		 * blocks, which pinned a core and reset the board. Drain below. */
 
-		int ret = poll(pfds, (nfds_t)npoll, app.configured ? 0 : 20);
+		int ret = poll(pfds, (nfds_t)npoll,
+			       loop_timeout_ms(app.configured, now_ms,
+					       last_spec_ms, last_metrics_ms));
 		if (ret < 0 && errno != EINTR) {
 			wl_display_cancel_read(app.display);
 			break;
@@ -1463,19 +1571,34 @@ int main(int argc, char **argv)
 		if (app.configured)
 			mic_drain(&app);
 
-		uint64_t now_ms = monotonic_ms();
+		now_ms = monotonic_ms();
 		bool metrics_due = app.configured && (now_ms - last_metrics_ms) >= 1000;
+		bool spec_due = app.configured &&
+				(app.spectro.dirty || app.spectro.window_ready) &&
+				(now_ms - last_spec_ms) >= SPEC_FRAME_MS;
 
 		if (metrics_due) {
-			last_metrics_ms = now_ms;
 			metrics_refresh(&app.metrics);
-			/* force=true: otherwise stats lost the race with spectrum. */
-			if (render(&app, true, true))
+			spectro_refresh_if_ready(&app.spectro);
+			/* Wait for a free buffer; stealing a busy one reset the SoC. */
+			if (render(&app, false, true)) {
+				last_metrics_ms = now_ms;
 				app.spectro.dirty = false;
-		} else if (app.configured && app.spectro.dirty) {
-			/* Clear dirty only after a successful commit. */
-			if (render(&app, true, false))
+				last_spec_ms = now_ms;
+			}
+		} else if (spec_due) {
+			spectro_refresh_if_ready(&app.spectro);
+			if (render(&app, false, false)) {
 				app.spectro.dirty = false;
+				last_spec_ms = now_ms;
+			}
+		}
+
+		/* Hard cap: Wayland/ALSA can leave poll() instantly ready. */
+		{
+			struct timespec slp = { .tv_sec = 0, .tv_nsec = (long)POLL_MIN_MS * 1000000L };
+
+			nanosleep(&slp, NULL);
 		}
 	}
 
