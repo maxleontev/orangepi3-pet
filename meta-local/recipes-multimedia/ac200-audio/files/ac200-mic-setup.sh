@@ -1,6 +1,24 @@
 #!/bin/sh
-# Configure AC200 onboard MIC1 capture path (Jernej mainline snd-soc-ac200).
-# Defaults: ADC Volume 7, Master capture 62%, MIC1 Boost 4 (voice level without clip).
+# Configure AC200 onboard MIC1 capture path (Jernej/Armbian snd-soc-ac200).
+#
+# The kernel driver leaves analog capture in a barely usable state. On Orange
+# Pi 3 we hit all of the following until this script ran at boot:
+#
+#   * ADC Volume defaulted to ~3/7 — recordings were almost silent.
+#     `amixer sset ADC 100%` changes a playback control, not this one.
+#     Use:  amixer cset name='ADC Volume' 7
+#
+#   * Short sset names are ambiguous (`I2S ADC` matches several widgets).
+#     Always cset the full control name from `amixer controls`.
+#
+#   * MIC1 Playback Switch must be off. Capture is:
+#       MIC1 Capture Switch on, I2S ADC Capture Switch on,
+#       MIC2 / I2S DAC / Output Mixer capture off.
+#
+#   * Master capture 85% + MIC1 Boost 4 rail-clipped (±32768, g440=0).
+#     Voice without clip on this board: Master cap 62%, Boost 4, ADC Volume 7.
+#
+# Image must ship alsa-utils-amixer; BusyBox has no amixer.
 set -eu
 
 CARD="${AC200_MIC_CARD:-0}"
@@ -39,6 +57,7 @@ done
 }
 
 # Full control names from snd-soc-ac200 (sset aliases are ambiguous).
+# Order: analog ADC gain, MIC1 capture (not playback), I2S ADC to CPU, mute loops.
 amixer -c "$CARD" cset name='ADC Volume' 7 >/dev/null
 amixer -c "$CARD" cset name='MIC1 Capture Switch' on,on >/dev/null
 amixer -c "$CARD" cset name='MIC1 Playback Switch' off,off >/dev/null

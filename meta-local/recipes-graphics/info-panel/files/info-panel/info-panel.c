@@ -1,7 +1,73 @@
 /*
  * Fullscreen Wayland info panel: CPU temp/usage, memory, uptime, STA IP/SSID,
- * setup-AP SSID/IP when hostapd mode is active, and a live mic spectrogram.
+ * setup-AP SSID/IP when hostapd mode is active, and a live mic spectrum.
  * Composited by Weston on DRM/KMS; GPU path is Mesa Lima (Mali).
+ *
+ * ---------------------------------------------------------------------------
+ * Microphone capture + spectrum (Orange Pi 3 / AC200)
+ * ---------------------------------------------------------------------------
+ *
+ * Hardware path
+ *   Onboard analog MIC1 -> X-Powers AC200 codec -> H6 I2S3 -> ALSA card
+ *   "ac200audio". Mixer routing is NOT done here: package ac200-audio
+ *   (recipes-multimedia/ac200-audio) runs ac200-mic-setup.service at boot.
+ *
+ * This process
+ *   1. Opens hw:CARD=ac200audio,DEV=0 as non-blocking capture (S16_LE,
+ *      stereo, 48 kHz, period 128). Override with INFO_PANEL_ALSA_DEVICE.
+ *   2. Polls Wayland + ALSA together (timeout 0 once configured) and drains
+ *      every available PCM period.
+ *   3. Takes the first interleaved channel, Hann-windows 512-sample frames
+ *      with hop 128 (~2.7 ms), FFT, maps bins onto a log 40 Hz..10 kHz
+ *      X axis and 20*log10(raw |X[k]|) on Y (−48..+24 dB).
+ *   4. Redraws only the bottom ~44% of the SHM buffer for spectrum frames;
+ *      full-frame stats redraw once per second.
+ *
+ * Problems found on this board and how they are handled
+ *
+ *   Mixer defaults were wrong (quiet or rail-clipped capture)
+ *     ADC Volume reset to ~3/7; `amixer sset ADC 100%` touched playback, not
+ *     capture gain; `sset "I2S ADC"` was ambiguous. MIC1 Playback Switch had
+ *     to be off; capture is MIC1 Capture + I2S ADC Capture. Master 85% +
+ *     MIC1 Boost 4 clipped at ±32768. Fix: boot script uses cset with full
+ *     names, ADC Volume=7, Master cap 62%, Boost 4.
+ *
+ *   weston could not open /dev/snd
+ *     PCM nodes are root:audio. info-panel.service adds SupplementaryGroups=
+ *     audio so the weston user can capture.
+ *
+ *   Spectrum looked like a waterfall (time on X)
+ *     First UI was a scrolling spectrogram. Requirement is a live analyser:
+ *     X = frequency (log 40..10000 Hz), Y = dB, both axes labelled.
+ *
+ *   "dB" overlapped the tick numbers
+ *     Rotated Y-axis title sat on top of −72/−60/…. Fix: wider left margin,
+ *     ticks right-aligned before the plot, "dB" in the top-left of the plot.
+ *
+ *   Trace did not move / felt seconds late
+ *     (1) Both wl_shm buffers stayed busy; render() skipped the frame but
+ *         still cleared spectro.dirty, so the display froze.
+ *     (2) 33 ms cap + exponential smoothing hid transients.
+ *     (3) poll() waited on Wayland only, so ALSA data sat until the next
+ *         timeout; each frame also redrew the whole stats pane.
+ *     Fix: never drop dirty until a successful commit; force-pick a buffer;
+ *     poll ALSA fds with timeout 0; hop 128; drain the PCM; damage only the
+ *     spectrum region; no smoothing.
+ *
+ *   Voice pinned the trace to the ceiling, then a "correct" FFT scale
+ *   made only the axes visible
+ *     Raw |X[k]| of ~0.5 already hit SPEC_MAX_DB=-6, so speech filled the
+ *     plot. Dividing by N*Hann gain put the same speech below −72 dB, so the
+ *     line sat on the X axis. Fix: plot 20*log10(raw bin mag) on −48..+24 dB
+ *     (voice in the middle, no full-scale peg, not glued to the floor).
+ *     Fill/stroke use opaque SOURCE (Wayland SHM is premultiplied; 0.22 alpha
+ *     fills were effectively invisible).
+ *
+ *   Stats pane updated about once a minute
+ *     Spectrum frames used force=true; the 1 Hz stats path used force=false
+ *     and lost every attempt while both buffers were busy. Metrics changed
+ *     in memory but the top of the screen did not. Fix: stats render also
+ *     force-picks a buffer.
  */
 
 #define _GNU_SOURCE
@@ -29,6 +95,7 @@
 #include "xdg-shell-client-protocol.h"
 
 #define MAX_CPU_CORES 8
+/* Match AC200 I2S3 simple-audio-card; period 128 keeps capture latency low. */
 #define MIC_RATE 48000
 #define MIC_CHANNELS 2
 #define MIC_PERIOD 128
@@ -36,11 +103,13 @@
 #define INFO_SPLIT 0.56
 
 #define FFT_N 512
+/* Hop 256 (~5 ms) felt sluggish; 128 (~2.7 ms) is one ALSA period. */
 #define FFT_HOP 128
 #define FFT_BINS (FFT_N / 2)
 #define SPEC_POINTS 256
 #define SPEC_MIN_HZ 40.0f
 #define SPEC_MAX_HZ 10000.0f
+/* See file header: −6 dB ceiling pegged speech; /N hid the trace on the axis. */
 #define SPEC_MIN_DB -48.0f
 #define SPEC_MAX_DB 24.0f
 #define MAX_POLL_FDS 8
@@ -69,6 +138,7 @@ struct shm_buffer {
 	int width;
 	int height;
 	bool busy;
+	/* Partial spectrum redraws must not wipe a buffer that never had stats. */
 	bool stats_valid;
 };
 
@@ -662,6 +732,11 @@ static void spectro_update(struct spectro_state *sp, const int16_t *samples)
 	}
 	fft_inplace(sp->fft_re, sp->fft_im, FFT_N);
 
+	/*
+	 * Log-frequency sampling of raw |X[k]| (no /N). Dividing by
+	 * FFT_N * Hann coherent gain mapped speech below SPEC_MIN_DB so the
+	 * stroke sat on the X axis and only the grid remained visible.
+	 */
 	for (int p = 0; p < SPEC_POINTS; p++) {
 		float freq = freq_at_point(p);
 		float bin_f = freq * (float)FFT_N / (float)MIC_RATE;
@@ -676,8 +751,6 @@ static void spectro_update(struct spectro_state *sp, const int16_t *samples)
 			float frac = bin_f - (float)b0;
 			float mag0 = hypotf(sp->fft_re[b0], sp->fft_im[b0]);
 			float mag1 = hypotf(sp->fft_re[b0 + 1], sp->fft_im[b0 + 1]);
-			/* Raw FFT bin magnitude. Scale [-48, 24] dB fits AC200 voice
-			 * without pinning the trace to the top or the X axis. */
 			mag = mag0 + frac * (mag1 - mag0);
 		}
 		db_new = mag_to_db(mag);
@@ -755,6 +828,7 @@ static void mic_open(struct app *app)
 	const char *dev = getenv("INFO_PANEL_ALSA_DEVICE");
 	int err;
 
+	/* simple-audio-card name from the AC200 DTS; mixer is set at boot. */
 	if (!dev || !dev[0])
 		dev = "hw:CARD=ac200audio,DEV=0";
 
@@ -809,6 +883,7 @@ static bool mic_poll(struct app *app)
 			break;
 		}
 		got = true;
+		/* Left channel only; AC200 capture is stereo-interleaved S16. */
 		for (snd_pcm_sframes_t i = 0; i < n; i++)
 			spectro_push_sample(&app->spectro, buf[i * mic->channels]);
 	}
@@ -852,6 +927,7 @@ static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b)
 	const double w = b->width;
 	const double h = b->height;
 	const double info_h = h * INFO_SPLIT;
+	/* 14% left margin: rotated "dB" used to sit on the numeric ticks. */
 	const double margin_l = w * 0.14;
 	const double margin_r = w * 0.04;
 	const double margin_t = h * 0.018;
@@ -911,6 +987,7 @@ static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b)
 	cairo_set_font_size(cr, label_size);
 	cairo_move_to(cr, plot_x + plot_w * 0.5 - label_size * 3.0, plot_y + plot_h + margin_b * 0.82);
 	cairo_show_text(cr, "Frequency (Hz)");
+	/* Horizontal title: a vertical "dB" next to the ticks overlapped them. */
 	cairo_move_to(cr, tick_size * 0.4, plot_y - tick_size * 0.6);
 	cairo_show_text(cr, "dB");
 
@@ -922,6 +999,7 @@ static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b)
 	if (sp->have_spectrum) {
 		double base_y = plot_y + plot_h;
 
+		/* Opaque SOURCE: rgba 0.22 fills disappeared on wl_shm (premult). */
 		cairo_save(cr);
 		cairo_rectangle(cr, plot_x, plot_y, plot_w, plot_h);
 		cairo_clip(cr);
@@ -1133,6 +1211,7 @@ static void draw_panel(struct app *app, struct shm_buffer *b, bool full)
 	cairo_surface_destroy(cs);
 }
 
+/* force: reuse a busy buffer rather than skip the frame (was freezing the plot). */
 static struct shm_buffer *pick_buffer(struct app *app, bool force)
 {
 	struct shm_buffer *fallback = NULL;
@@ -1356,6 +1435,7 @@ int main(int argc, char **argv)
 			wl_display_dispatch_pending(app.display);
 		wl_display_flush(app.display);
 
+		/* Wayland + ALSA in one poll; timeout 0 once the surface exists. */
 		npoll = 0;
 		pfds[npoll].fd = wl_display_get_fd(app.display);
 		pfds[npoll].events = POLLIN;
@@ -1389,10 +1469,11 @@ int main(int argc, char **argv)
 		if (metrics_due) {
 			last_metrics_ms = now_ms;
 			metrics_refresh(&app.metrics);
-			/* Force a buffer: spectrum updates keep both shm buffers busy. */
+			/* force=true: otherwise stats lost the race with spectrum. */
 			if (render(&app, true, true))
 				app.spectro.dirty = false;
 		} else if (app.configured && app.spectro.dirty) {
+			/* Clear dirty only after a successful commit. */
 			if (render(&app, true, false))
 				app.spectro.dirty = false;
 		}
