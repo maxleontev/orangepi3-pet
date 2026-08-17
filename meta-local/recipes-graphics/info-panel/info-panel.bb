@@ -1,6 +1,7 @@
 SUMMARY = "Fullscreen HDMI info panel (CPU, memory, IP, WiFi) for Weston"
 DESCRIPTION = "Wayland client that renders a real-time system dashboard on \
-the HDMI output (CPU temperature and per-core usage, memory, IP, WiFi SSID). \
+the HDMI output (CPU temperature and per-core usage, memory, IP, WiFi SSID) \
+plus a live AC200 microphone spectrum (ALSA capture). \
 Weston composites via DRM/KMS using Mesa Lima (Mali-T720)."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
@@ -28,4 +29,4 @@ do_install:append() {
 
 FILES:${PN} += "${systemd_system_unitdir}/info-panel.service"
 
-RDEPENDS:${PN} += "weston-init liberation-fonts iw alsa-lib"
+RDEPENDS:${PN} += "weston-init liberation-fonts iw alsa-lib ac200-audio"

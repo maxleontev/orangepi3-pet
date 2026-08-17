@@ -4,7 +4,7 @@
 # bitbake does not propagate image-recipe vars into virtual/kernel.
 # IMAGE_BOOT_FILES is set in core-image-khepri.bb.
 
-FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:${THISDIR}/../../recipes-multimedia/ac200-audio/files:"
 
 KERNEL_CLASSES:append:orange-pi-3 = " kernel-fitimage"
 KERNEL_IMAGETYPES:append:orange-pi-3 = " fitImage"
@@ -12,14 +12,8 @@ KERNEL_IMAGETYPES:append:orange-pi-3 = " fitImage"
 # F2FS for the GPT data partition (LABEL=data).
 SRC_URI:append:orange-pi-3 = " file://f2fs.cfg"
 
-# Onboard analog microphone (AC200 codec on I2S3). Not the LTS ePHY stack.
-SRC_URI:append:orange-pi-3 = " \
-    file://audio.cfg \
-    file://0001-mfd-Add-support-for-X-Powers-AC200.patch \
-    file://0002-arm64-dts-sun50i-h6-add-AC200-analog-codec-nodes.patch \
-    file://0003-arm64-dts-sun50i-h6-orangepi-3-enable-AC200-codec.patch \
-    file://0004-ASoC-AC200-Initial-driver.patch \
-"
+# Onboard analog microphone: kernel bits from recipe ac200-audio.
+require recipes-multimedia/ac200-audio/ac200-audio-kernel.inc
 
 # files/drm.cfg overrides meta-sunxi's fragment (same file://drm.cfg name)
 # when MACHINEOVERRIDES includes use-mailine-graphics.

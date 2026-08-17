@@ -8,6 +8,7 @@ PartOf=weston.service
 Type=simple
 User=weston
 Group=weston
+# /dev/snd/pcmC0D0c is root:audio; without this group capture fails (EPERM).
 SupplementaryGroups=wayland audio
 Environment=XDG_RUNTIME_DIR=/run
 Environment=WAYLAND_DISPLAY=wayland-0
