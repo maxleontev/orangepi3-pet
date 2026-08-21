@@ -18,9 +18,10 @@
  *   2. Polls Wayland + ALSA together with a real timeout (next 5 Hz frame
  *      or 1 Hz stats, at least 10 ms) and drains every available PCM period.
  *   3. Takes the first interleaved channel into a rolling Hann window of
- *      512 samples (hop 128). FFT runs only when a display frame is due,
+ *      2048 samples (hop 128). FFT runs only when a display frame is due,
  *      then bins are mapped onto log 40 Hz..10 kHz X and 20*log10(raw
- *      |X[k]|) on Y (−48..+24 dB).
+ *      |X[k]|) on Y (−48..+24 dB). Bin width ≈ 23.4 Hz so 40–100 Hz is
+ *      no longer a single shared bin (512 was ≈ 93.8 Hz).
  *   4. Redraws only the bottom ~44% of the SHM buffer for spectrum frames
  *      at ~5 Hz; full-frame stats redraw once per second. Never attach a
  *      wl_shm buffer the compositor has not released.
@@ -79,7 +80,7 @@
  *     fine, and dmesg had no oops (panic=10 would have logged one). The
  *     SoC then reset (unclean FAT on /boot). Fix: 5 Hz cap, poll never
  *     shorter than 10 ms, ignore ALSA POLLOUT (it kept poll() from sleeping),
- *     FFT only on display ticks, stroke-only trace (no filled path), axes
+ *     FFT only on display ticks, vertical bar analyzer (no continuous curve), axes
  *     only on the 1 Hz full frame, never attach a buffer still held by Weston.
  */
 
@@ -115,11 +116,14 @@
 #define MIC_RETRY_MS 2000
 #define INFO_SPLIT 0.56
 
-#define FFT_N 512
-/* Hop 256 (~5 ms) felt sluggish; 128 (~2.7 ms) is one ALSA period. */
+/* 2048 @ 48 kHz → ≈23.4 Hz/bin (512 was ≈93.8 Hz and collapsed all <100 Hz). */
+#define FFT_N 2048
+/* Hop 128 (~2.7 ms) is one ALSA period; FFT itself runs at SPEC_FRAME_MS. */
 #define FFT_HOP 128
 #define FFT_BINS (FFT_N / 2)
 #define SPEC_POINTS 256
+/* Vertical bar analyzer: fewer bars than FFT samples so gaps stay visible. */
+#define SPEC_BARS 56
 #define SPEC_MIN_HZ 40.0f
 #define SPEC_MAX_HZ 10000.0f
 /* See file header: −6 dB ceiling pegged speech; /N hid the trace on the axis. */
@@ -758,15 +762,21 @@ static void spectro_update(struct spectro_state *sp, const int16_t *samples)
 	for (int p = 0; p < SPEC_POINTS; p++) {
 		float freq = freq_at_point(p);
 		float bin_f = freq * (float)FFT_N / (float)MIC_RATE;
-		int b0 = (int)bin_f;
+		int b0;
+		float frac;
 		float mag, db_new;
 
-		if (b0 < 1)
+		/* Skip DC (bin 0). Do not invent a negative frac below bin 1. */
+		if (bin_f < 1.0f) {
 			b0 = 1;
-		if (b0 >= FFT_BINS - 1)
-			b0 = FFT_BINS - 2;
+			frac = 0.0f;
+		} else {
+			b0 = (int)bin_f;
+			if (b0 >= FFT_BINS - 1)
+				b0 = FFT_BINS - 2;
+			frac = bin_f - (float)b0;
+		}
 		{
-			float frac = bin_f - (float)b0;
 			float mag0 = hypotf(sp->fft_re[b0], sp->fft_im[b0]);
 			float mag1 = hypotf(sp->fft_re[b0 + 1], sp->fft_im[b0 + 1]);
 			mag = mag0 + frac * (mag1 - mag0);
@@ -1073,21 +1083,46 @@ static void draw_spectrogram(struct app *app, cairo_t *cr, struct shm_buffer *b,
 	cairo_show_text(cr, "dB");
 
 	if (sp->have_spectrum) {
+		const double y_floor = plot_y + plot_h - 1.0;
+		const double bar_slot = plot_w / (double)SPEC_BARS;
+		const double bar_gap = bar_slot > 3.0 ? 1.0 : 0.0;
+		const double bar_w = bar_slot - 2.0 * bar_gap;
+		int b;
+
 		cairo_save(cr);
-		/* Inset so a 2px trace at +24 dB cannot chew the top stroke. */
+		/* Inset so bars at +24 dB cannot chew the top stroke. */
 		cairo_rectangle(cr, plot_x + 1.0, plot_y + 2.0, plot_w - 2.0, plot_h - 3.0);
 		cairo_clip(cr);
 		cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
 		cairo_set_source_rgb(cr, 0.45, 0.88, 1.0);
-		cairo_set_line_width(cr, 2.0);
-		cairo_move_to(cr, spec_freq_to_x(freq_at_point(0), plot_x, plot_w),
-			      spec_db_to_y(sp->db[0], plot_y, plot_h));
-		for (int p = 1; p < SPEC_POINTS; p++) {
-			double x = spec_freq_to_x(freq_at_point(p), plot_x, plot_w);
-			double y = spec_db_to_y(sp->db[p], plot_y, plot_h);
-			cairo_line_to(cr, x, y);
+		for (b = 0; b < SPEC_BARS; b++) {
+			int p0 = (b * SPEC_POINTS) / SPEC_BARS;
+			int p1 = ((b + 1) * SPEC_POINTS) / SPEC_BARS;
+			float db = SPEC_MIN_DB;
+			double x0;
+			double y;
+			int p;
+
+			if (p1 <= p0)
+				p1 = p0 + 1;
+			for (p = p0; p < p1 && p < SPEC_POINTS; p++) {
+				if (sp->db[p] > db)
+					db = sp->db[p];
+			}
+			y = spec_db_to_y(db, plot_y, plot_h);
+			if (y > y_floor)
+				continue;
+			x0 = plot_x + (double)b * bar_slot + bar_gap;
+			if (bar_w >= 1.5) {
+				cairo_rectangle(cr, x0, y, bar_w, y_floor - y);
+				cairo_fill(cr);
+			} else {
+				cairo_set_line_width(cr, 1.0);
+				cairo_move_to(cr, x0 + 0.5, y_floor);
+				cairo_line_to(cr, x0 + 0.5, y);
+				cairo_stroke(cr);
+			}
 		}
-		cairo_stroke(cr);
 		cairo_restore(cr);
 	}
 
