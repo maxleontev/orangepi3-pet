@@ -18,6 +18,8 @@ Related config outside this folder (required for a working image):
 
 ## What you see on HDMI
 
+![HDMI info-panel: system stats and live mic spectrum](hdmi.png)
+
 After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client draws:
 
 **Top ~56%**
@@ -251,6 +253,7 @@ Build and flash steps for the full image (including this stack) are in the
 ```text
 recipes-graphics/
 ├── README.md                          (this file)
+├── hdmi.png                           (sample info-panel screenshot)
 ├── display-rf-blacklist/
 │   ├── display-rf-blacklist.bb
 │   └── files/blacklist-display-wifi.conf
