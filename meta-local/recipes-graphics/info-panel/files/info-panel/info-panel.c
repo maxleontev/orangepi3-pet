@@ -82,6 +82,12 @@
  *     shorter than 10 ms, ignore ALSA POLLOUT (it kept poll() from sleeping),
  *     FFT only on display ticks, vertical bar analyzer (no continuous curve), axes
  *     only on the 1 Hz full frame, never attach a buffer still held by Weston.
+ *
+ * On-demand screenshot (SIGUSR1)
+ *   /usr/sbin/hdmi-screenshot signals this process. The handler only sets a
+ *   flag; the main loop dumps the last committed SHM buffer to PNG (read is
+ *   safe while Weston still holds the buffer). Do not dump from the handler
+ *   and do not attach a busy buffer to take a shot.
  */
 
 #define _GNU_SOURCE
@@ -95,6 +101,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -115,6 +122,11 @@
 #define MIC_PERIOD 128
 #define MIC_RETRY_MS 2000
 #define INFO_SPLIT 0.56
+
+/* Handshake with /usr/sbin/hdmi-screenshot (atomic rename onto SHOT_PNG). */
+#define SHOT_PNG "/tmp/info-panel-screenshot.png"
+#define SHOT_TMP "/tmp/info-panel-screenshot.png.tmp"
+#define SHOT_ERR "/tmp/info-panel-screenshot.err"
 
 /* 2048 @ 48 kHz → ≈23.4 Hz/bin (512 was ≈93.8 Hz and collapsed all <100 Hz). */
 #define FFT_N 2048
@@ -201,6 +213,8 @@ struct app {
 	bool running;
 	struct shm_buffer buffers[2];
 	int buffer_idx;
+	int last_committed;
+	bool have_committed;
 	struct panel_metrics metrics;
 	struct mic_state mic;
 	struct spectro_state spectro;
@@ -265,6 +279,70 @@ static void shm_buffer_destroy(struct shm_buffer *b)
 	if (b->data && b->data != MAP_FAILED)
 		munmap(b->data, b->size);
 	memset(b, 0, sizeof(*b));
+}
+
+static volatile sig_atomic_t screenshot_requested;
+
+static void on_sigusr1(int signo)
+{
+	(void)signo;
+	screenshot_requested = 1;
+}
+
+static void shot_fail(const char *msg)
+{
+	FILE *f;
+
+	fprintf(stderr, "info-panel: screenshot: %s\n", msg);
+	f = fopen(SHOT_ERR, "w");
+	if (f) {
+		fprintf(f, "%s\n", msg);
+		fclose(f);
+	}
+	unlink(SHOT_PNG);
+	unlink(SHOT_TMP);
+}
+
+static void dump_screenshot(struct app *app)
+{
+	struct shm_buffer *b;
+	cairo_surface_t *cs;
+	cairo_status_t st;
+
+	screenshot_requested = 0;
+	unlink(SHOT_ERR);
+
+	if (!app->have_committed) {
+		shot_fail("no frame committed yet");
+		return;
+	}
+	b = &app->buffers[app->last_committed];
+	if (!b->data || b->data == MAP_FAILED || b->width <= 0 || b->height <= 0) {
+		shot_fail("committed buffer is empty");
+		return;
+	}
+
+	cs = cairo_image_surface_create_for_data(
+		b->data, CAIRO_FORMAT_ARGB32, b->width, b->height, b->width * 4);
+	if (cairo_surface_status(cs) != CAIRO_STATUS_SUCCESS) {
+		cairo_surface_destroy(cs);
+		shot_fail("cairo surface failed");
+		return;
+	}
+	cairo_surface_mark_dirty(cs);
+	st = cairo_surface_write_to_png(cs, SHOT_TMP);
+	cairo_surface_destroy(cs);
+	if (st != CAIRO_STATUS_SUCCESS) {
+		shot_fail(cairo_status_to_string(st));
+		return;
+	}
+	if (rename(SHOT_TMP, SHOT_PNG) != 0) {
+		shot_fail("rename failed");
+		return;
+	}
+	chmod(SHOT_PNG, 0644);
+	fprintf(stderr, "info-panel: screenshot %dx%d -> %s\n",
+		b->width, b->height, SHOT_PNG);
 }
 
 static double read_temp_milli_file(const char *path)
@@ -1388,6 +1466,8 @@ static bool render(struct app *app, bool force_buffer, bool full)
 	else
 		wl_surface_damage_buffer(app->surface, 0, spec_y, width, height - spec_y);
 	wl_surface_commit(app->surface);
+	app->last_committed = (int)(b - app->buffers);
+	app->have_committed = true;
 	return true;
 }
 
@@ -1569,6 +1649,15 @@ int main(int argc, char **argv)
 	xdg_toplevel_set_fullscreen(app.xdg_toplevel, app.output);
 	wl_surface_commit(app.surface);
 
+	{
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = on_sigusr1;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGUSR1, &sa, NULL);
+	}
+
 	struct pollfd pfds[MAX_POLL_FDS];
 	int npoll;
 
@@ -1628,6 +1717,9 @@ int main(int argc, char **argv)
 				last_spec_ms = now_ms;
 			}
 		}
+
+		if (screenshot_requested)
+			dump_screenshot(&app);
 
 		/* Hard cap: Wayland/ALSA can leave poll() instantly ready. */
 		{
