@@ -3,8 +3,8 @@
 Helpers for building, flashing, and verifying A/B updates. Run from the
 repository root (paths below are relative to the repo root).
 
-On-target tools (`ab-update`, `ab-confirm`, …) are documented in the top-level
-[README](../../README.md).
+On-target tools (`ab-update`, `ab-confirm`, `hdmi-screenshot`, …) are
+documented in the top-level [README](../../README.md).
 
 ## `make-ab-update-bundle.sh`
 
@@ -48,6 +48,28 @@ No positional arguments. Override via environment:
 
 SSH exit code `255` from `ab-update` is treated as the expected reboot drop;
 final success still requires the post-reboot checks above.
+
+## `pull-hdmi-screenshot.sh`
+
+SSHs to the board, runs `/usr/sbin/hdmi-screenshot` (info-panel SHM dump), and
+saves the PNG on the host. Existing files are not overwritten: if `hdmi.png`
+is present, the next shot is `hdmi-0001.png`, then `hdmi-0002.png`, and so on.
+
+```bash
+SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh
+SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
+```
+
+| Argument / env | Default | Description |
+|----------------|---------|-------------|
+| `OUT` (optional positional) | `$PWD/hdmi.png` | Local PNG path (auto-numbered if taken) |
+| `TARGET` | `root@192.168.3.71` | SSH target |
+| `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
+| `SSH_BIND` | | Bind address when the host has dual NICs |
+| `TIMEOUT_SEC` | `8` | Seconds for info-panel to write the frame on the board |
+
+Requires a live `info-panel` on the target. This is the compositor client buffer,
+not a photograph of the monitor.
 
 ## `test-ab-update-scheme.sh`
 
