@@ -206,6 +206,7 @@ cat /run/weston-drm-device
 ls -l /dev/dri /sys/class/drm/card*-HDMI-A-*/status
 cat /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp
 iw dev wlan0 link
+hdmi-screenshot /tmp/hdmi.png   # PNG of the live info-panel SHM buffer
 ```
 
 Stop graphics (e.g. to debug WiFi RF):
@@ -263,6 +264,7 @@ recipes-graphics/
 └── info-panel/
     ├── info-panel.bb
     └── files/
+        ├── hdmi-screenshot.sh          → /usr/sbin/hdmi-screenshot
         ├── info-panel.service
         └── info-panel/
             ├── info-panel.c

@@ -9,6 +9,7 @@ LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda
 SRC_URI = " \
     file://info-panel \
     file://info-panel.service \
+    file://hdmi-screenshot.sh \
 "
 
 S = "${WORKDIR}/info-panel"
@@ -25,8 +26,10 @@ SYSTEMD_AUTO_ENABLE = "enable"
 do_install:append() {
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${WORKDIR}/info-panel.service ${D}${systemd_system_unitdir}/
+    install -d ${D}${sbindir}
+    install -m 0755 ${WORKDIR}/hdmi-screenshot.sh ${D}${sbindir}/hdmi-screenshot
 }
 
-FILES:${PN} += "${systemd_system_unitdir}/info-panel.service"
+FILES:${PN} += "${systemd_system_unitdir}/info-panel.service ${sbindir}/hdmi-screenshot"
 
 RDEPENDS:${PN} += "weston-init liberation-fonts iw alsa-lib ac200-audio"
