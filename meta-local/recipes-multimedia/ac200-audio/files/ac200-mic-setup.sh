@@ -16,7 +16,10 @@
 #       MIC2 / I2S DAC / Output Mixer capture off.
 #
 #   * Master capture 85% + MIC1 Boost 4 rail-clipped (±32768, g440=0).
-#     Voice without clip on this board: Master cap 62%, Boost 4, ADC Volume 7.
+#     Voice without clip: Master cap 62%, ADC Volume 7. Boost defaults to 3
+#     (was 4): onboard MIC1 also picks up ~50 Hz mains/rumble; Boost 3 keeps
+#     speech usable while cutting that floor ~a few dB. Override with
+#     AC200_MIC_BOOST if you need more sensitivity.
 #
 # Image must ship alsa-utils-amixer; BusyBox has no amixer.
 set -eu
@@ -24,7 +27,7 @@ set -eu
 # Prefer the card name: index 0 exists in /proc/asound before amixer can use it.
 CARD="${AC200_MIC_CARD:-ac200audio}"
 MASTER_CAP="${AC200_MIC_MASTER_CAP:-62}"
-MIC_BOOST="${AC200_MIC_BOOST:-4}"
+MIC_BOOST="${AC200_MIC_BOOST:-3}"
 
 usage() {
 	cat <<EOF
@@ -33,7 +36,7 @@ Usage: ${0##*/}
 Env:
   AC200_MIC_CARD       ALSA card name or index (default: ac200audio)
   AC200_MIC_MASTER_CAP Master capture percent 0-100 (default: 62)
-  AC200_MIC_BOOST      MIC1 Boost 0-7 (default: 4)
+  AC200_MIC_BOOST      MIC1 Boost 0-7 (default: 3)
 EOF
 }
 
