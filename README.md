@@ -67,6 +67,32 @@ sd-to-emmc [--yes] [--no-grow] [SRC DST]
 Must run as root. After success: power off, remove the SD card, power on
 (BROM prefers SD if the card is still inserted).
 
+### On target: `hdmi-screenshot` (`/usr/sbin/hdmi-screenshot`)
+
+Dumps the live HDMI info-panel frame (last committed Wayland SHM buffer) to PNG.
+Installed by the `info-panel` recipe. `info-panel` must be running.
+
+```bash
+hdmi-screenshot                  # TTY: /tmp/hdmi-screenshot.png (prints path)
+hdmi-screenshot > /tmp/hdmi.png  # PNG on stdout
+hdmi-screenshot /data/hdmi.png
+```
+
+From the host (same SSH defaults as `push-ab-update.sh`; existing local files
+are kept — next free name is `hdmi-0001.png`, `hdmi-0002.png`, …):
+
+```bash
+SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh
+SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
+```
+
+| Argument / env | Default | Description |
+|----------------|---------|-------------|
+| `DEST` (optional positional) | stdout, or `/tmp/hdmi-screenshot.png` on a TTY | Output PNG path |
+| `TIMEOUT_SEC` | `8` | Seconds to wait for info-panel to write the frame |
+
+This is the compositor client buffer, not a photograph of the monitor.
+
 ## Active A/B slot
 
 Boot uses `root=PARTUUID=…` (not `PARTLABEL`) so SD and eMMC do not clash.
