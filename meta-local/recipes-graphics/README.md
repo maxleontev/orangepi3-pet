@@ -32,10 +32,10 @@ After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client dra
 
 **Bottom ~44%**
 
-- Live **microphone spectrum** (AC200 analog codec, I2S3)  
+- Live **microphone spectrum** (AC200 analog codec, I2S3) as a **vertical bar** analyzer  
 - X axis: **40 Hz – 10 kHz** (log scale); Y axis: **dB** (−48 … 24)  
 - ALSA capture via `hw:CARD=ac200audio`; override with `INFO_PANEL_ALSA_DEVICE`  
-- FFT 512 / hop 128 @ 48 kHz; spectrum redraw **~5 Hz** (a 0 ms poll + per-hop commits hard-reset the board)  
+- FFT **2048** / hop 128 @ 48 kHz (≈23.4 Hz/bin); **56** bars (max per band); spectrum redraw **~5 Hz** (a 0 ms poll + per-hop commits hard-reset the board)  
 - Board metrics still update at **1 Hz**
 
 ---
