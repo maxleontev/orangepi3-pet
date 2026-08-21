@@ -11,13 +11,16 @@ Related config outside this folder (required for a working image):
 | Distro features / Mesa providers | `meta-local/conf/distro/include/orangepi3-graphics.inc` (required from `build-orangepi3/conf/local.conf`) |
 | Machine: `use-mailine-graphics`, OpenGL | `meta-local/conf/machine/orange-pi-3.conf` |
 | Kernel DRM/Lima/THS fragments | `meta-local/recipes-kernel/linux/files/drm.cfg` |
-| Image packages | `core-image-khepri.bb` → `weston weston-init info-panel kmscube display-rf-blacklist` |
+| AC200 analog microphone | `meta-local/recipes-multimedia/ac200-audio/` (mixer + kernel inc) |
+| Image packages | `core-image-khepri.bb` → `weston weston-init info-panel kmscube display-rf-blacklist ac200-audio` |
 
 ---
 
 ## What you see on HDMI
 
 After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client draws:
+
+**Top ~56%**
 
 - Hostname and local time  
 - **CPU temperature** (°C) from `/sys/class/thermal` (prefer `cpu-thermal`) or hwmon  
@@ -27,7 +30,13 @@ After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client dra
 - **WiFi SSID** via `/usr/sbin/iw dev wlan0 link`  
 - Footer: Wayland/Weston · Mali (Lima)
 
-Refresh rate: **4 Hz** (250 ms).
+**Bottom ~44%**
+
+- Live **microphone spectrum** (AC200 analog codec, I2S3) as a **vertical bar** analyzer  
+- X axis: **40 Hz – 10 kHz** (log scale); Y axis: **dB** (−48 … 24)  
+- ALSA capture via `hw:CARD=ac200audio`; override with `INFO_PANEL_ALSA_DEVICE`  
+- FFT **2048** / hop 128 @ 48 kHz (≈23.4 Hz/bin); **56** bars (max per band); spectrum redraw **~5 Hz** (a 0 ms poll + per-hop commits hard-reset the board)  
+- Board metrics still update at **1 Hz**
 
 ---
 
@@ -265,6 +274,6 @@ recipes-graphics/
 ## Limitations
 
 - Enabling HDMI/DRM can still degrade or drop **2.4 GHz** WiFi; **5 GHz** is preferred when in range.  
-- info-panel is a Cairo/shm client (not a GL UI); Lima is mainly for Weston/compositing and tools like kmscube.  
+- info-panel is a Cairo/shm client (not a GL UI). Weston uses **pixman** to composite it; Lima GL compositing of per-hop SHM commits hard-reset the board. kmscube still uses Lima.  
 - Thermal zones require a kernel built with both `SUN8I_THERMAL` and `NVMEM_SUNXI_SID`.  
 - HDMI cable must present a connector (`connected`, or `unknown` after late PHY bind); fully `disconnected` leaves pick-drm failing and Weston restarting.

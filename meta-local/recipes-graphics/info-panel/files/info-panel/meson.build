@@ -3,6 +3,8 @@ project('info-panel', 'c', version: '1.0.0', default_options: ['warning_level=2'
 wayland_client = dependency('wayland-client')
 wayland_protos = dependency('wayland-protocols', version: '>=1.15')
 cairo = dependency('cairo')
+alsa = dependency('alsa')
+libm = meson.get_compiler('c').find_library('m', required: false)
 
 wayland_scanner_prog = find_program('wayland-scanner', native: true)
 protocols_dir = wayland_protos.get_variable('pkgdatadir')
@@ -28,6 +30,6 @@ executable(
   'info-panel.c',
   xdg_shell_client_header,
   xdg_shell_private_code,
-  dependencies: [wayland_client, cairo],
+  dependencies: [wayland_client, cairo, alsa, libm],
   install: true,
 )

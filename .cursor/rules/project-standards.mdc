@@ -42,12 +42,22 @@ After rebuilding the image, flash/update with:
 
 ```bash
 bitbake core-image-khepri
-SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host
+
+- use SSH_BIND=192.168.3.37 in case there is two host network in use and you want to use wifi, 
+- otherwise use SSH_BIND=192.168.3.6 to use host ethernet
+SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host, use wifi
+SSH_BIND=192.168.3.6 meta-local/scripts/push-ab-update.sh   # use ethernet in other cases
 ```
 
 - Use `push-ab-update.sh` for deploy-and-verify; do not hand-roll SSH update steps.
 - do not change push-ab-update.sh itself
 
+## Host audio (tone / spectrum tests)
+
+- Never change host audio routing or settings — not even for tests.
+- Forbidden: `pactl set-default-sink`, `set-sink-mute` / `set-sink-volume` on sinks, forcing ALSA `hw:`/`plughw:` devices, WirePlumber/GNOME sound reconfiguration, or any other host audio preference change.
+- Play only to the **current system default** output (`paplay` / Pulse `default` with **no** `-d` / device override; same for `ffmpeg -f pulse default`).
+- If the tone is silent: report the active Default Sink / Description and stop; do **not** switch sinks to “make it work”.
 
 ## General
 
