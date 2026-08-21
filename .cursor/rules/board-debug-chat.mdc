@@ -1,0 +1,14 @@
+---
+description: During Orange Pi 3 board debug, post frequent chat updates with Logitech HDMI photos
+alwaysApply: true
+---
+
+# Board debug: chat updates + Logitech camera
+
+When debugging the live board (HDMI panel, audio, WiFi, reboots, Weston):
+
+- Write **short status updates in chat often** (after each SSH snapshot, each HDMI frame, each hypothesis). Do not stay silent through long tool batches.
+- Include **photos of the HDMI monitor** in those updates, not only text.
+- Camera is the **Logitech UVC** (`046d:0825`, typically `/dev/video2`), **not** the Chicony laptop webcam (`04f2:b695`, `/dev/video0`).
+- Capture with MJPEG, e.g. `ffmpeg -y -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video2 -frames:v 1 /tmp/hdmi.jpg`, then attach that file so the image is visible in chat.
+- On each photo, note uptime, CPU cores, temp, and what the spectrum/panel shows.

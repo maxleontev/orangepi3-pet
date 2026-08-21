@@ -1,0 +1,14 @@
+[Unit]
+Description=Configure AC200 onboard microphone mixer
+After=local-fs.target systemd-udevd.service
+Before=info-panel.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/ac200-mic-setup.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
