@@ -28,7 +28,10 @@ TARGET="${TARGET:-root@192.168.3.71}"   # env overrides with sensible defaults
 - Use `#!/bin/bash` + `pipefail` on host; `#!/bin/sh` + `set -eu` on target (BusyBox).
 - Configurable behavior via env vars, not positional args (see existing scripts).
 - Add a header comment and `usage()` for user-facing tools.
-- When changing scripts or on-target tools, update `README.md` or `meta-local/scripts/README.md`.
+- Docs: host script usage only in `meta-local/scripts/README.md`; on-target
+  `/usr/sbin/*` usage only in the top-level `README.md`. Recipe READMEs may
+  inventory and link, not repeat the same command blocks.
+- When changing scripts or on-target tools, update the matching README above.
 
 ## Yocto / Recipes
 

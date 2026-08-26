@@ -14,9 +14,9 @@
  *
  * This process
  *   1. Opens hw:CARD=ac200audio,DEV=0 as non-blocking capture (S16_LE,
- *      stereo, 48 kHz, period 128). Override with INFO_PANEL_ALSA_DEVICE.
- *   2. Polls Wayland + ALSA together with a real timeout (next 5 Hz frame
- *      or 1 Hz stats, at least 10 ms) and drains every available PCM period.
+ *      stereo, 48 kHz, period 1024). Override with INFO_PANEL_ALSA_DEVICE.
+ *   2. Polls Wayland with a real timeout (next 5 Hz frame or 1 Hz stats,
+ *      at least 10 ms) and drains available PCM in that same turn.
  *   3. Takes the first interleaved channel into a rolling Hann window of
  *      2048 samples (hop 128). FFT runs only when a display frame is due,
  *      then bins are mapped onto log 40 Hz..10 kHz X and 20*log10(raw
@@ -116,10 +116,17 @@
 #include "xdg-shell-client-protocol.h"
 
 #define MAX_CPU_CORES 8
-/* Match AC200 I2S3 simple-audio-card; period 128 keeps capture latency low. */
+/* Match AC200 I2S3 simple-audio-card.
+ * Period 128 caused ~375 nonblocking readi/s; each ioctl spent ms in
+ * snd_pcm_update_hw_ptr0/soc_pcm_pointer (sunxi has no PCM timer,
+ * /proc/.../status tstamp stays 0). That pinned one core in stime and
+ * starved the 5 Hz spectrum redraw. 1024 → ~47 xfer/s, still <1 period
+ * of latency vs the 200 ms display tick.
+ */
 #define MIC_RATE 48000
 #define MIC_CHANNELS 2
-#define MIC_PERIOD 128
+#define MIC_PERIOD 1024
+#define MIC_BUFFER 8192
 #define MIC_RETRY_MS 2000
 #define INFO_SPLIT 0.56
 
@@ -924,10 +931,16 @@ static int mic_configure_pcm(snd_pcm_t *pcm, unsigned *channels)
 		return err;
 	{
 		snd_pcm_uframes_t period = MIC_PERIOD;
+		snd_pcm_uframes_t buffer = MIC_BUFFER;
+
 		err = snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, NULL);
+		if (err < 0)
+			return err;
+		/* Default buffer was 131072; keep a few periods only. */
+		err = snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
+		if (err < 0)
+			return err;
 	}
-	if (err < 0)
-		return err;
 	err = snd_pcm_hw_params(pcm, hw);
 	if (err < 0)
 		return err;
@@ -1008,8 +1021,8 @@ static bool mic_poll(struct app *app)
 
 static void mic_drain(struct app *app)
 {
-	while (mic_poll(app))
-		;
+	/* mic_poll already reads until EAGAIN; a second call is another ioctl. */
+	(void)mic_poll(app);
 }
 
 static double spec_freq_to_x(double freq, double plot_x, double plot_w)

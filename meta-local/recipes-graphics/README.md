@@ -115,9 +115,11 @@ networking remain primary even if Weston fails.
 ### Why `weston-prepare-drm` (not only `modprobe sun4i-drm`)
 
 Blacklisting also blocks **dependent** HDMI pieces from udev. Loading only
-`sun4i-drm` is not enough for a usable HDMI connector. Probe is often deferred
+`sun4i-drm` is not enough for a usable HDMI connector. `display_connector` must load first (asserts `ddc-en` / PH2) or EDID
+stays empty and HDMI audio is silent despite a working ALSA card. Probe is often deferred
 (“Couldn't get the HDMI PHY”, then bind), so `/dev/dri/card*` may appear
-several seconds after `modprobe` returns. The helper loads the full set and waits.
+several seconds after `modprobe` returns. The helper loads the full set
+(including `dw_hdmi_i2s_audio` for card `allwinner-hdmi`) and waits.
 
 ### Why `weston-pick-drm`
 

@@ -8,9 +8,15 @@
 #   friends; loading only sun4i-drm is not enough for an HDMI connector.
 # - sun4i-drm probe is deferred ("Couldn't get the HDMI PHY" then bind) so
 #   /dev/dri/card* may appear several seconds after modprobe returns.
+# - display_connector must load BEFORE HDMI: it drives ddc-en (PH2). Without
+#   that, EDID is empty and HDMI audio has no ELD / stays silent.
+# - dw_hdmi_i2s_audio is blacklisted at boot; load it with DRM for ALSA
+#   card allwinner-hdmi (ac200-mic-hdmi-play / monitor speakers).
 set -eu
 
-for m in sun4i-drm sun8i-mixer sun8i-drm-hdmi lima; do
+modprobe display_connector || true
+
+for m in sun4i-drm sun8i-mixer sun8i-drm-hdmi dw_hdmi_i2s_audio lima; do
 	modprobe "$m" || true
 done
 
