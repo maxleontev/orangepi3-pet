@@ -12,6 +12,7 @@ see [`meta-local/scripts/README.md`](meta-local/scripts/README.md).
 On-target tools are installed into the image as `/usr/sbin/*` from
 `meta-local/recipes-support/`.
 
+<a id="ab-update"></a>
 ### On target: `ab-update` (`/usr/sbin/ab-update`)
 
 Writes a local bundle into the **inactive** A/B slot (`rootfs` + `fitImage_{a|b}`),
@@ -32,6 +33,7 @@ ab-update [--yes] [--no-reboot] BUNDLE
 Must run as root. Remounts `/boot` onto the boot partition of the **same disk
 as live root** when `LABEL=boot` is ambiguous (SD + eMMC).
 
+<a id="ab-confirm"></a>
 ### On target: `ab-confirm` (`/usr/sbin/ab-confirm`)
 
 Clears `upgrade_available` / `bootcount` after a successful boot so U-Boot will
@@ -48,6 +50,7 @@ ab-confirm
 
 No positional arguments. Exits quietly if there is no pending upgrade.
 
+<a id="sd-to-emmc"></a>
 ### On target: `sd-to-emmc` (`/usr/sbin/sd-to-emmc`)
 
 Clones the running SD GPT layout (SPL @ 128 KiB, boot / rootfs_a / rootfs_b /
@@ -67,6 +70,7 @@ sd-to-emmc [--yes] [--no-grow] [SRC DST]
 Must run as root. After success: power off, remove the SD card, power on
 (BROM prefers SD if the card is still inserted).
 
+<a id="hdmi-screenshot"></a>
 ### On target: `hdmi-screenshot` (`/usr/sbin/hdmi-screenshot`)
 
 Dumps the live HDMI info-panel frame (last committed Wayland SHM buffer) to PNG.
@@ -84,8 +88,9 @@ hdmi-screenshot /data/hdmi.png
 | `TIMEOUT_SEC` | `8` | Seconds to wait for info-panel to write the frame |
 
 This is the compositor client buffer, not a photograph of the monitor.
-Host wrapper: [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md).
+Host wrapper: [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot).
 
+<a id="ac200-mic-hdmi-play"></a>
 ### On target: `ac200-mic-hdmi-play` (`/usr/sbin/ac200-mic-hdmi-play`)
 
 Records AC200 MIC1 for `DURATION_SEC` seconds (default **5**), then plays that
@@ -96,7 +101,7 @@ Installed by `ac200-audio`.
 DURATION_SEC=20 ac200-mic-hdmi-play
 ```
 
-Host wrapper: [`run-ac200-mic-hdmi-play.sh`](meta-local/scripts/README.md).
+Host wrapper: [`run-ac200-mic-hdmi-play.sh`](meta-local/scripts/README.md#run-ac200-mic-hdmi-play).
 
 ## Active A/B slot
 
@@ -119,7 +124,7 @@ require conf/distro/include/orangepi3-graphics.inc
 ```
 
 Then build (`bitbake core-image-khepri`) and flash with
-[`push-ab-update.sh`](meta-local/scripts/README.md).
+[`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update).
 
 Expect a larger rootfs than a WiFi-only image (Weston, Mesa, fonts, DRM modules).
 HDMI stack details: [`meta-local/recipes-graphics/README.md`](meta-local/recipes-graphics/README.md).

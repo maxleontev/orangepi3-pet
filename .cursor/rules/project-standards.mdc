@@ -32,6 +32,8 @@ TARGET="${TARGET:-root@192.168.3.71}"   # env overrides with sensible defaults
   - Host script usage **only** in `meta-local/scripts/README.md`
   - On-target `/usr/sbin/*` usage **only** in the top-level `README.md`
   - Recipe READMEs may inventory and link, not repeat the same command blocks
+  - Cross-links use section anchors (e.g. `README.md#hdmi-screenshot`,
+    `scripts/README.md#push-ab-update`), not bare file paths
 - Agent rules (`.cursor/rules`): do not restate full host/on-target usage;
   point at those READMEs. May add agent-only constraints (e.g. `OUT=` under
   `build-orangepi3/tmp/`, which `SSH_BIND` to prefer).
@@ -64,7 +66,7 @@ bitbake core-image-khepri
 ## A/B Updates & Flashing
 
 After rebuilding the image (`bitbake core-image-khepri` in `build-orangepi3`),
-flash with [`push-ab-update.sh`](meta-local/scripts/README.md) — do not
+flash with [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update) — do not
 hand-roll SSH update steps and do not change that script. Prefer
 `SSH_BIND=192.168.3.6` (ethernet) or `192.168.3.37` (WiFi on dual-NIC hosts).
 

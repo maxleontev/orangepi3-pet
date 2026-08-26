@@ -20,7 +20,7 @@ Weston):
   `build-orangepi3/tmp/hdmi-cam.jpg`.
 - Capture methods (prefer **1**; use **2** when needed):
   1. **SHM dump over SSH (default):** use
-     [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md) from the repo
+     [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot) from the repo
      root with `OUT=build-orangepi3/tmp/hdmi.png` and
      `SSH_BIND=192.168.3.6` (or `192.168.3.37` for WiFi on a dual-NIC host).
      Attach the resulting PNG in chat. On the board this is

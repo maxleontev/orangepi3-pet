@@ -4,8 +4,9 @@ Helpers for building, flashing, and verifying A/B updates. Run from the
 repository root (paths below are relative to the repo root).
 
 On-target tools (`ab-update`, `ab-confirm`, `hdmi-screenshot`, …) are
-documented in the top-level [README](../../README.md).
+documented in the top-level [README](../../README.md#scripts).
 
+<a id="make-ab-update-bundle"></a>
 ## `make-ab-update-bundle.sh`
 
 Packs a local A/B update bundle (`rootfs.ext4` + `fitImage`) from the Yocto
@@ -20,8 +21,9 @@ meta-local/scripts/make-ab-update-bundle.sh [OUT.tar.gz]
 | `OUT` (optional positional) | `$PWD/khepri-ab-update.tar.gz` | Output archive path |
 | `DEPLOY` | `build-orangepi3/tmp/deploy/images/orange-pi-3` | Deploy directory with `.ext4` and FIT |
 
-Apply on the board with `ab-update`.
+Apply on the board with [`ab-update`](../../README.md#ab-update).
 
+<a id="push-ab-update"></a>
 ## `push-ab-update.sh`
 
 Builds a bundle, uploads it over SSH as root, runs `/usr/sbin/ab-update` on
@@ -50,6 +52,7 @@ No positional arguments. Override via environment:
 SSH exit code `255` from `ab-update` is treated as the expected reboot drop;
 final success still requires the post-reboot checks above.
 
+<a id="pull-hdmi-screenshot"></a>
 ## `pull-hdmi-screenshot.sh`
 
 SSHs to the board, runs `/usr/sbin/hdmi-screenshot` (info-panel SHM dump), and
@@ -71,6 +74,7 @@ SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
 Requires a live `info-panel` on the target. This is the compositor client buffer,
 not a photograph of the monitor.
 
+<a id="run-ac200-mic-hdmi-play"></a>
 ## `run-ac200-mic-hdmi-play.sh`
 
 SSHs to the board and runs `/usr/sbin/ac200-mic-hdmi-play`: record AC200 MIC1,
@@ -90,6 +94,7 @@ DURATION_SEC=20 SSH_BIND=192.168.3.6 meta-local/scripts/run-ac200-mic-hdmi-play.
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs |
 
+<a id="test-ab-update-scheme"></a>
 ## `test-ab-update-scheme.sh`
 
 End-to-end A/B verification over SSH against a live board:
@@ -125,6 +130,7 @@ after reflash).
 
 Exit status is non-zero if any enabled test fails or SSH does not return in time.
 
+<a id="cp_d"></a>
 ## `cp_d`
 
 Flashes the latest deployed `.wic.gz` to a block device (default `/dev/sda`).
@@ -138,11 +144,13 @@ Uses image
 Requires `sudo` for `dd`. Override target with `DEST=/dev/sdX` or deploy dir with
 `DEPLOY=...`.
 
+<a id="f_cl_d"></a>
 ## `f_cl_d`
 
 Wipes a block device with zeros (default `/dev/sda`). Destructive; requires
 `sudo`. Override with `DEST=/dev/sdX`.
 
+<a id="instll"></a>
 ## `instll`
 
 Commented notes for host package install and cloning Poky / OE / meta-sunxi /
