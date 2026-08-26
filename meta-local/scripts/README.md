@@ -33,7 +33,7 @@ confirmed (`upgrade_available=0`, `bootcount=0`, slot switched). Prints one of:
 - `RESULT: FAIL (verification didn't pass)` — SSH up, but slot/confirm checks failed
 
 ```bash
-meta-local/scripts/push-ab-update.sh
+SSH_BIND=192.168.3.6 meta-local/scripts/push-ab-update.sh
 ```
 
 No positional arguments. Override via environment:
@@ -42,6 +42,7 @@ No positional arguments. Override via environment:
 |-----|---------|-------------|
 | `TARGET` | `root@192.168.3.71` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
+| `SSH_BIND` | | Bind address when the host has dual NICs (`192.168.3.6` ethernet, `192.168.3.37` WiFi) |
 | `REMOTE_DIR` | `/data/update` | Remote directory for the bundle |
 | `BUNDLE_NAME` | `khepri-ab-update.tar.gz` | Bundle file name on the device |
 | `SSH_WAIT_SEC` | `300` | Max seconds to wait for SSH after reboot |
@@ -56,7 +57,6 @@ saves the PNG on the host. Existing files are not overwritten: if `hdmi.png`
 is present, the next shot is `hdmi-0001.png`, then `hdmi-0002.png`, and so on.
 
 ```bash
-SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh
 SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
 ```
 

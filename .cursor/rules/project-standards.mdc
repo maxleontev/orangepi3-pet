@@ -28,9 +28,13 @@ TARGET="${TARGET:-root@192.168.3.71}"   # env overrides with sensible defaults
 - Use `#!/bin/bash` + `pipefail` on host; `#!/bin/sh` + `set -eu` on target (BusyBox).
 - Configurable behavior via env vars, not positional args (see existing scripts).
 - Add a header comment and `usage()` for user-facing tools.
-- Docs: host script usage only in `meta-local/scripts/README.md`; on-target
-  `/usr/sbin/*` usage only in the top-level `README.md`. Recipe READMEs may
-  inventory and link, not repeat the same command blocks.
+- Docs (user-facing READMEs):
+  - Host script usage **only** in `meta-local/scripts/README.md`
+  - On-target `/usr/sbin/*` usage **only** in the top-level `README.md`
+  - Recipe READMEs may inventory and link, not repeat the same command blocks
+- Agent rules (`.cursor/rules`): do not restate full host/on-target usage;
+  point at those READMEs. May add agent-only constraints (e.g. `OUT=` under
+  `build-orangepi3/tmp/`, which `SSH_BIND` to prefer).
 - When changing scripts or on-target tools, update the matching README above.
 
 ## Yocto / Recipes
@@ -59,20 +63,10 @@ bitbake core-image-khepri
 
 ## A/B Updates & Flashing
 
-After rebuilding the image, flash/update with:
-
-```bash
-# from build-orangepi3 after oe-init-build-env, or with that env already sourced:
-bitbake core-image-khepri
-
-# use SSH_BIND=192.168.3.37 in case there is two host network in use and you want to use wifi,
-# otherwise use SSH_BIND=192.168.3.6 to use host ethernet
-SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host, use wifi
-SSH_BIND=192.168.3.6 meta-local/scripts/push-ab-update.sh   # use ethernet in other cases
-```
-
-- Use `push-ab-update.sh` for deploy-and-verify; do not hand-roll SSH update steps.
-- do not change push-ab-update.sh itself
+After rebuilding the image (`bitbake core-image-khepri` in `build-orangepi3`),
+flash with [`push-ab-update.sh`](meta-local/scripts/README.md) — do not
+hand-roll SSH update steps and do not change that script. Prefer
+`SSH_BIND=192.168.3.6` (ethernet) or `192.168.3.37` (WiFi on dual-NIC hosts).
 
 ## Host audio (tone / spectrum tests)
 
