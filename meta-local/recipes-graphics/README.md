@@ -210,7 +210,7 @@ cat /run/weston-drm-device
 ls -l /dev/dri /sys/class/drm/card*-HDMI-A-*/status
 cat /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp
 iw dev wlan0 link
-# panel PNG: see [root README](../../../README.md) (`hdmi-screenshot`)
+# panel PNG: see [hdmi-screenshot](../../../README.md#hdmi-screenshot)
 ```
 
 Stop graphics (e.g. to debug WiFi RF):
