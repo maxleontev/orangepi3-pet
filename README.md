@@ -93,6 +93,18 @@ SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
 
 This is the compositor client buffer, not a photograph of the monitor.
 
+### On target: `ac200-mic-hdmi-play` (`/usr/sbin/ac200-mic-hdmi-play`)
+
+Records AC200 MIC1 for `DURATION_SEC` seconds (default **5**), then plays that
+WAV over HDMI (monitor speakers). Stops `info-panel` for the capture.
+Installed by `ac200-audio`.
+
+```bash
+DURATION_SEC=20 ac200-mic-hdmi-play
+```
+
+Host wrapper: [`run-ac200-mic-hdmi-play.sh`](meta-local/scripts/README.md).
+
 ## Active A/B slot
 
 Boot uses `root=PARTUUID=…` (not `PARTLABEL`) so SD and eMMC do not clash.

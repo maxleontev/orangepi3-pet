@@ -71,6 +71,25 @@ SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
 Requires a live `info-panel` on the target. This is the compositor client buffer,
 not a photograph of the monitor.
 
+## `run-ac200-mic-hdmi-play.sh`
+
+SSHs to the board and runs `/usr/sbin/ac200-mic-hdmi-play`: record AC200 MIC1,
+then play that WAV over HDMI (monitor speakers). Stops `info-panel` for the
+capture and starts it again after playback.
+
+```bash
+DURATION_SEC=20 SSH_BIND=192.168.3.6 meta-local/scripts/run-ac200-mic-hdmi-play.sh
+```
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `DURATION_SEC` | `5` | Capture length in seconds |
+| `STOP_INFO_PANEL` | `1` | Stop info-panel around capture |
+| `KEEP_WAV` | `0` | Keep temp WAV on the board |
+| `TARGET` | `root@192.168.3.71` | SSH target |
+| `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
+| `SSH_BIND` | | Bind address when the host has dual NICs |
+
 ## `test-ab-update-scheme.sh`
 
 End-to-end A/B verification over SSH against a live board:
