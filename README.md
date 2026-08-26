@@ -78,20 +78,13 @@ hdmi-screenshot > /tmp/hdmi.png  # PNG on stdout
 hdmi-screenshot /data/hdmi.png
 ```
 
-From the host (same SSH defaults as `push-ab-update.sh`; existing local files
-are kept — next free name is `hdmi-0001.png`, `hdmi-0002.png`, …):
-
-```bash
-SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh
-SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
-```
-
 | Argument / env | Default | Description |
 |----------------|---------|-------------|
 | `DEST` (optional positional) | stdout, or `/tmp/hdmi-screenshot.png` on a TTY | Output PNG path |
 | `TIMEOUT_SEC` | `8` | Seconds to wait for info-panel to write the frame |
 
 This is the compositor client buffer, not a photograph of the monitor.
+Host wrapper: [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md).
 
 ### On target: `ac200-mic-hdmi-play` (`/usr/sbin/ac200-mic-hdmi-play`)
 
@@ -125,12 +118,8 @@ fw_printenv -n bootslot
 require conf/distro/include/orangepi3-graphics.inc
 ```
 
-Then build and push an A/B update over SSH:
-
-```bash
-bitbake core-image-khepri
-SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # if dual-NIC host
-```
+Then build (`bitbake core-image-khepri`) and flash with
+[`push-ab-update.sh`](meta-local/scripts/README.md).
 
 Expect a larger rootfs than a WiFi-only image (Weston, Mesa, fonts, DRM modules).
 HDMI stack details: [`meta-local/recipes-graphics/README.md`](meta-local/recipes-graphics/README.md).

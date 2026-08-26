@@ -19,15 +19,14 @@ Weston):
   `build-orangepi3/tmp/hdmi.png`, `build-orangepi3/tmp/hdmi-0001.png`,
   `build-orangepi3/tmp/hdmi-cam.jpg`.
 - Capture methods (prefer **1**; use **2** when needed):
-  1. **SHM dump over SSH (default):** from the repo root,
-     `SSH_BIND=192.168.3.6 OUT=build-orangepi3/tmp/hdmi.png \
-       meta-local/scripts/pull-hdmi-screenshot.sh`
-     (or `SSH_BIND=192.168.3.37` for WiFi on a dual-NIC host). Use
-     `OUT=` so files land in `build-orangepi3/tmp/` (numbered
-     `hdmi-0001.png`, … if the script sequences). Attach the
-     resulting PNG in chat. On the board this is
-     `/usr/sbin/hdmi-screenshot` (last committed info-panel
-     `wl_shm` buffer) — pixel-exact for the panel content.
+  1. **SHM dump over SSH (default):** use
+     [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md) from the repo
+     root with `OUT=build-orangepi3/tmp/hdmi.png` and
+     `SSH_BIND=192.168.3.6` (or `192.168.3.37` for WiFi on a dual-NIC host).
+     Attach the resulting PNG in chat. On the board this is
+     `/usr/sbin/hdmi-screenshot` (last committed info-panel `wl_shm`
+     buffer) — pixel-exact for the panel content; see the top-level README
+     for on-target usage.
   2. **Camera (physical HDMI / monitor):** when you need what is
      actually on the cable/monitor (black screen, wrong mode, hung
      compositor, or SHM dump unavailable). Use the Logitech UVC
