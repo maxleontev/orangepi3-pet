@@ -36,15 +36,28 @@ TARGET="${TARGET:-root@192.168.3.71}"   # env overrides with sensible defaults
 - Install files via `SRC_URI`, `do_install`, and `FILES:${PN}` — not ad-hoc rootfs edits.
 - `local.conf` must include `require conf/distro/include/orangepi3-graphics.inc`.
 
+## Yocto build directory
+
+- **Always** use `build-orangepi3/` only. Never `oe-init-build-env` / `bitbake` against repo-root `build/` (or any other build dir).
+- Init and build:
+
+```bash
+source poky/oe-init-build-env build-orangepi3
+bitbake core-image-khepri
+```
+
+- Do not create or populate a top-level `build/` directory.
+
 ## A/B Updates & Flashing
 
 After rebuilding the image, flash/update with:
 
 ```bash
+# from build-orangepi3 after oe-init-build-env, or with that env already sourced:
 bitbake core-image-khepri
 
-- use SSH_BIND=192.168.3.37 in case there is two host network in use and you want to use wifi, 
-- otherwise use SSH_BIND=192.168.3.6 to use host ethernet
+# use SSH_BIND=192.168.3.37 in case there is two host network in use and you want to use wifi,
+# otherwise use SSH_BIND=192.168.3.6 to use host ethernet
 SSH_BIND=192.168.3.37 meta-local/scripts/push-ab-update.sh   # dual-NIC host, use wifi
 SSH_BIND=192.168.3.6 meta-local/scripts/push-ab-update.sh   # use ethernet in other cases
 ```
