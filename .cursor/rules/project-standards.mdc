@@ -48,6 +48,12 @@ bitbake core-image-khepri
 
 - Do not create or populate a top-level `build/` directory.
 
+## Debug screenshots / video
+
+- Temporary host-side debug images and videos (HDMI SHM shots, camera
+  frames, short clips) go under `build-orangepi3/tmp/`, not the repo
+  root. See `board-debug-chat` for capture commands.
+
 ## A/B Updates & Flashing
 
 After rebuilding the image, flash/update with:
