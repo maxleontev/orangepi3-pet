@@ -71,7 +71,7 @@ SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
 | `SSH_BIND` | | Bind address when the host has dual NICs |
 | `TIMEOUT_SEC` | `8` | Seconds for info-panel to write the frame on the board |
 
-Requires a live `info-panel` on the target. This is the compositor client buffer,
+Requires a live `info-panel` or `info-panel-camera` on the target. This is the compositor client buffer,
 not a photograph of the monitor.
 
 <a id="run-ac200-mic-hdmi-play"></a>

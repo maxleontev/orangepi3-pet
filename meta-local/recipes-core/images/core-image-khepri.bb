@@ -10,8 +10,16 @@ LICENSE = "MIT"
 IMAGE_FEATURES += "splash read-only-rootfs"
 
 IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init hostapd dnsmasq mc sd-to-emmc root-ssh-keys ab-update"
-IMAGE_INSTALL:append = " weston weston-init info-panel kmscube display-rf-blacklist"
+IMAGE_INSTALL:append = " weston weston-init kmscube display-rf-blacklist"
 IMAGE_INSTALL:append = " ac200-audio"
+# INFO_PANEL from orangepi3-graphics.inc / local.conf: "stats" or "camera".
+IMAGE_INSTALL:append = "${@bb.utils.contains('INFO_PANEL', 'camera', ' info-panel-camera', ' info-panel', d)}"
+
+python() {
+    v = (d.getVar('INFO_PANEL') or 'stats').strip()
+    if v not in ('stats', 'camera'):
+        bb.fatal('INFO_PANEL must be "stats" or "camera", got %r' % v)
+}
 
 
 # Must match INITRAMFS_IMAGE in linux-mainline bbappend (kernel recipe scope).
