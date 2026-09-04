@@ -73,8 +73,9 @@ Must run as root. After success: power off, remove the SD card, power on
 <a id="hdmi-screenshot"></a>
 ### On target: `hdmi-screenshot` (`/usr/sbin/hdmi-screenshot`)
 
-Dumps the live HDMI info-panel frame (last committed Wayland SHM buffer) to PNG.
-Installed by the `info-panel` recipe. `info-panel` must be running.
+Dumps the live HDMI panel frame (last committed Wayland SHM buffer) to PNG.
+Installed by whichever panel recipe is in the image (`info-panel` or
+`info-panel-camera`). That panel process must be running.
 
 ```bash
 hdmi-screenshot                  # TTY: /tmp/hdmi-screenshot.png (prints path)
@@ -85,7 +86,7 @@ hdmi-screenshot /data/hdmi.png
 | Argument / env | Default | Description |
 |----------------|---------|-------------|
 | `DEST` (optional positional) | stdout, or `/tmp/hdmi-screenshot.png` on a TTY | Output PNG path |
-| `TIMEOUT_SEC` | `8` | Seconds to wait for info-panel to write the frame |
+| `TIMEOUT_SEC` | `8` | Seconds to wait for the panel to write the frame |
 
 This is the compositor client buffer, not a photograph of the monitor.
 Host wrapper: [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot).

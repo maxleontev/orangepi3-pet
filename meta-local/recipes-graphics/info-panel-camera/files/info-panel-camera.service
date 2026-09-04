@@ -1,0 +1,28 @@
+[Unit]
+Description=HDMI live USB camera panel
+After=weston.service
+BindsTo=weston.service
+PartOf=weston.service
+
+[Service]
+Type=simple
+User=weston
+Group=weston
+# /dev/video* is typically root:video; weston user is in video via weston-init.
+SupplementaryGroups=wayland video
+Environment=XDG_RUNTIME_DIR=/run
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=MESA_LOADER_DRIVER_OVERRIDE=lima
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# Prefer QVGA over the GL3510 hub (override with INFO_PANEL_CAMERA_SIZE).
+Environment=INFO_PANEL_CAMERA_SIZE=320x240
+# Root: wait for Wayland, fix video node perms, disable USB autosuspend (built-in usbcore).
+ExecStartPre=+/bin/sh -c 'i=0; while [ ! -S /run/wayland-0 ] && [ $i -lt 50 ]; do i=$((i+1)); sleep 0.2; done; [ -S /run/wayland-0 ]'
+ExecStartPre=+/bin/sh -c 'for n in /dev/video*; do [ -e "$n" ] || continue; chgrp video "$n" 2>/dev/null; chmod 660 "$n" 2>/dev/null; done; true'
+ExecStartPre=+/bin/sh -c 'echo -1 > /sys/module/usbcore/parameters/autosuspend 2>/dev/null; echo 128 > /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null; true'
+ExecStart=/usr/bin/info-panel-camera
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=weston.service

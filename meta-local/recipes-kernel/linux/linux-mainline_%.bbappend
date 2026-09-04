@@ -12,6 +12,12 @@ KERNEL_IMAGETYPES:append:orange-pi-3 = " fitImage"
 # F2FS for the GPT data partition (LABEL=data).
 SRC_URI:append:orange-pi-3 = " file://f2fs.cfg"
 
+# USB UVC webcams (/dev/video*) for info-panel-camera.
+SRC_URI:append:orange-pi-3 = " file://uvc.cfg"
+
+# H6 USB3 PHY for Type-A ports (GL3510 hub on dwc3); without it no USB hosts.
+SRC_URI:append:orange-pi-3 = " file://usb3-phy.cfg"
+
 # Onboard analog microphone: kernel bits from recipe ac200-audio.
 require recipes-multimedia/ac200-audio/ac200-audio-kernel.inc
 

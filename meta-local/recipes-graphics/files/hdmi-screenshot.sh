@@ -1,8 +1,9 @@
 #!/bin/sh
 # Capture the live HDMI info-panel frame (last committed wl_shm buffer) to PNG.
 #
-# info-panel dumps to /tmp/info-panel-screenshot.png on SIGUSR1. This helper
-# signals the panel, waits for the atomic rename, then copies to DEST or stdout.
+# Works with either info-panel (stats) or info-panel-camera: both dump to
+# /tmp/info-panel-screenshot.png on SIGUSR1. This helper signals whichever
+# is running, waits for the atomic rename, then copies to DEST or stdout.
 set -eu
 
 SHOT_PNG="/tmp/info-panel-screenshot.png"
@@ -24,22 +25,41 @@ EOF
 log() { printf '%s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Prefer camera if both somehow run; only one is in a given image.
+# /proc/comm is 15 chars — "info-panel-camera" appears as "info-panel-came".
 panel_pid() {
 	pid=""
+	name=""
 	if command -v pidof >/dev/null 2>&1; then
-		pid=$(pidof info-panel 2>/dev/null || true)
-		pid=${pid%% *}
+		for n in info-panel-camera info-panel; do
+			pid=$(pidof "$n" 2>/dev/null || true)
+			pid=${pid%% *}
+			if [ -n "$pid" ]; then
+				name=$n
+				break
+			fi
+		done
 	fi
 	if [ -z "$pid" ]; then
 		for d in /proc/[0-9]*; do
 			c=$(cat "$d/comm" 2>/dev/null || true)
-			[ "$c" = "info-panel" ] || continue
+			case "$c" in
+			info-panel-came|info-panel-camera)
+				name=info-panel-camera
+				;;
+			info-panel)
+				name=info-panel
+				;;
+			*)
+				continue
+				;;
+			esac
 			pid=${d#/proc/}
 			break
 		done
 	fi
 	[ -n "$pid" ] || return 1
-	printf '%s\n' "$pid"
+	printf '%s %s\n' "$pid" "$name"
 }
 
 DEST=""
@@ -61,15 +81,18 @@ case "${1:-}" in
 	;;
 esac
 
-pid=$(panel_pid) || die "info-panel is not running"
+info=$(panel_pid) || die "info-panel / info-panel-camera is not running"
+pid=${info%% *}
+panel=${info#* }
+
 rm -f "$SHOT_PNG" "$SHOT_ERR" "${SHOT_PNG}.tmp"
 
-kill -USR1 "$pid" || die "failed to signal info-panel (pid $pid)"
+kill -USR1 "$pid" || die "failed to signal $panel (pid $pid)"
 
 i=0
 while [ "$i" -lt "$TIMEOUT_SEC" ]; do
 	if [ -f "$SHOT_ERR" ]; then
-		die "info-panel: $(cat "$SHOT_ERR")"
+		die "$panel: $(cat "$SHOT_ERR")"
 	fi
 	if [ -f "$SHOT_PNG" ]; then
 		break

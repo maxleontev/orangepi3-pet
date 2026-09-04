@@ -12,11 +12,24 @@ Related config outside this folder (required for a working image):
 | Machine: `use-mailine-graphics`, OpenGL | `meta-local/conf/machine/orange-pi-3.conf` |
 | Kernel DRM/Lima/THS fragments | `meta-local/recipes-kernel/linux/files/drm.cfg` |
 | AC200 analog microphone | `meta-local/recipes-multimedia/ac200-audio/` (mixer + kernel inc) |
-| Image packages | `core-image-khepri.bb` → `weston weston-init info-panel kmscube display-rf-blacklist ac200-audio` |
+| Image packages | `core-image-khepri.bb` → `weston weston-init` + panel (`info-panel` or `info-panel-camera`) + `kmscube display-rf-blacklist ac200-audio` |
+| Panel switch | `INFO_PANEL` in `local.conf` (`stats` default, or `camera`) via `orangepi3-graphics.inc` |
 
 ---
 
 ## What you see on HDMI
+
+Which fullscreen client is installed is selected at **image build** time:
+
+```bash
+# build-orangepi3/conf/local.conf
+INFO_PANEL = "stats"    # default — system stats + mic spectrum
+INFO_PANEL = "camera"   # live USB UVC preview (Logitech etc.)
+```
+
+Only one of `info-panel` / `info-panel-camera` is in the rootfs.
+
+### `INFO_PANEL = "stats"` (default)
 
 ![HDMI info-panel: system stats and live mic spectrum](hdmi.png)
 
@@ -39,6 +52,17 @@ After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client dra
 - ALSA capture via `hw:CARD=ac200audio`; override with `INFO_PANEL_ALSA_DEVICE`  
 - FFT **2048** / hop 128 @ 48 kHz (≈23.4 Hz/bin); **56** bars (max per band); spectrum redraw **~5 Hz** (a 0 ms poll + per-hop commits hard-reset the board)  
 - Board metrics still update at **1 Hz**
+
+### `INFO_PANEL = "camera"`
+
+Fullscreen **info-panel-camera**: live preview from a USB UVC webcam (e.g. Logitech).
+
+- V4L2 MMAP capture; prefer **MJPEG** (libjpeg-turbo), fallback **YUYV**
+- Letterboxed onto the HDMI output with a thin status bar (device / size / format)
+- Device: `INFO_PANEL_CAMERA_DEVICE=/dev/videoN` (default: first capture node)
+- Size hint: `INFO_PANEL_CAMERA_SIZE=WxH` (else tries 1280×720 … 640×480)
+- Redraw capped ~15 fps; same wl_shm busy-buffer rules as the stats panel
+- Kernel: `uvc.cfg` enables `CONFIG_MEDIA_USB_SUPPORT` + `CONFIG_USB_VIDEO_CLASS=m`
 
 ---
 
@@ -99,8 +123,9 @@ around that constraint.
      · weston-pick-drm.sh → /run/weston-drm-device (HDMI card name)
    ExecStart: weston --drm-device=…
 
-5. info-panel.service (After/BindsTo/PartOf=weston.service)
-   waits for /run/wayland-0, then runs /usr/bin/info-panel as user weston.
+5. Panel service (After/BindsTo/PartOf=weston.service)
+   waits for /run/wayland-0, then runs either
+   `/usr/bin/info-panel` or `/usr/bin/info-panel-camera` (see INFO_PANEL).
 ```
 
 Default target stays **`multi-user.target`** (not `graphical.target`) so SSH and
@@ -159,10 +184,22 @@ Also pulls in stock Weston bits (socket, user `weston`, PAM autologin, etc.).
 
 Meson + Wayland client (`info-panel.c`) + `info-panel.service`.
 
+- Installed when `INFO_PANEL = "stats"` (default).
 - `SYSTEMD_AUTO_ENABLE = enable`, WantedBy=`weston.service`.  
-- `RDEPENDS`: `weston-init`, `liberation-fonts`, `iw`.  
+- `RDEPENDS`: `weston-init`, `liberation-fonts`, `iw`, `alsa-lib`, `ac200-audio`.  
 - Service sets `PATH` including `/usr/sbin` so `iw` is found as user weston.  
 - `MESA_LOADER_DRIVER_OVERRIDE=lima` for any GL path (panel itself uses Cairo/shm).
+- Shared `/usr/sbin/hdmi-screenshot` from `recipes-graphics/files/`.
+
+### `info-panel-camera/`
+
+Meson + Wayland client (`info-panel-camera.c`) + `info-panel-camera.service`.
+
+- Installed when `INFO_PANEL = "camera"` in `local.conf`.
+- Live USB UVC preview (V4L2 + libjpeg-turbo MJPEG / YUYV).
+- `SupplementaryGroups=wayland video`; weston user already in `video` via weston-init.
+- Installs shared `/usr/sbin/hdmi-screenshot` (same script as stats; signals
+  whichever panel is running).
 
 ### Image extra: `kmscube`
 
@@ -182,6 +219,17 @@ From `meta-local/recipes-kernel/linux/files/drm.cfg` (overrides meta-sunxi’s
   deferred probe waiting for `thermal-sensor-calibration@14`, and the panel
   shows CPU temperature as **n/a**
 
+USB webcams (`uvc.cfg`):
+
+- `CONFIG_MEDIA_USB_SUPPORT=y`, `CONFIG_USB_VIDEO_CLASS=m` — `/dev/video*` for UVC
+  (mainline aarch64 defconfig leaves USB media off)
+
+Type-A USB hosts (`usb3-phy.cfg`):
+
+- `CONFIG_PHY_SUN50I_USB3=y` — required; all Type-A ports are behind a GL3510
+  hub on dwc3. Without the H6 USB3 PHY, `5200000.usb` stays deferred and
+  cameras never appear in `lsusb`.
+
 Machine override:
 
 ```text
@@ -199,15 +247,16 @@ MACHINE_FEATURES:append = " opengl"
 | `wifi-roam.service` | yes | Pick stronger band by RSSI; PartOf wifi |
 | `weston.service` | yes | Starts DRM stack; may stress 2.4 GHz RF |
 | `weston.socket` | yes | Triggered with weston |
-| `info-panel.service` | yes | Tied to weston lifecycle |
+| `info-panel.service` | when stats | Tied to weston lifecycle |
+| `info-panel-camera.service` | when camera | Tied to weston lifecycle |
 
 Useful commands on the board:
 
 ```sh
-systemctl status wifi weston info-panel --no-pager -l
-journalctl -u weston -u info-panel -b --no-pager -l
+systemctl status wifi weston info-panel info-panel-camera --no-pager -l
+journalctl -u weston -u info-panel -u info-panel-camera -b --no-pager -l
 cat /run/weston-drm-device
-ls -l /dev/dri /sys/class/drm/card*-HDMI-A-*/status
+ls -l /dev/dri /sys/class/drm/card*-HDMI-A-*/status /dev/video*
 cat /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp
 iw dev wlan0 link
 # panel PNG: see [hdmi-screenshot](../../../README.md#hdmi-screenshot)
@@ -216,7 +265,7 @@ iw dev wlan0 link
 Stop graphics (e.g. to debug WiFi RF):
 
 ```sh
-systemctl stop info-panel weston
+systemctl stop info-panel info-panel-camera weston
 # optional: unload display modules
 modprobe -r sun8i_drm_hdmi lima sun4i_drm 2>/dev/null || true
 ```
@@ -224,7 +273,10 @@ modprobe -r sun8i_drm_hdmi lima sun4i_drm 2>/dev/null || true
 Start again (modules loaded by prepare script):
 
 ```sh
-systemctl start weston info-panel
+systemctl start weston
+# then whichever panel the image shipped:
+systemctl start info-panel          # INFO_PANEL=stats
+systemctl start info-panel-camera   # INFO_PANEL=camera
 ```
 
 ---
@@ -266,13 +318,21 @@ recipes-graphics/
 │       ├── weston.service
 │       ├── weston-prepare-drm.sh
 │       └── weston-pick-drm.sh
-└── info-panel/
-    ├── info-panel.bb
+├── files/
+│   └── hdmi-screenshot.sh             → /usr/sbin/hdmi-screenshot (both panels)
+├── info-panel/
+│   ├── info-panel.bb
+│   └── files/
+│       ├── info-panel.service
+│       └── info-panel/
+│           ├── info-panel.c
+│           └── meson.build
+└── info-panel-camera/
+    ├── info-panel-camera.bb
     └── files/
-        ├── hdmi-screenshot.sh          → /usr/sbin/hdmi-screenshot
-        ├── info-panel.service
-        └── info-panel/
-            ├── info-panel.c
+        ├── info-panel-camera.service
+        └── info-panel-camera/
+            ├── info-panel-camera.c
             └── meson.build
 ```
 
