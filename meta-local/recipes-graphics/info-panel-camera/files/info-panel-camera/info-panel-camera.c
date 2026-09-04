@@ -6,6 +6,9 @@
  * Device: INFO_PANEL_CAMERA_DEVICE, else first /dev/video* with CAPTURE.
  * Size hint: INFO_PANEL_CAMERA_SIZE=WxH (default try 1280x720 … 640x480).
  *
+ * Motion: frame-diff on grayscale (no OpenCV). Yellow Cairo bbox where
+ * pixels changed; held a few frames so it stays visible at ~5 fps.
+ *
  * Lessons from info-panel on this H6 board: never attach a busy wl_shm
  * buffer; poll with a real timeout; cap redraw rate (FRAME_MS).
  *
@@ -46,6 +49,11 @@
 #define CAM_RETRY_MAX_MS 8000
 #define STATUS_H 36
 #define DECODE_FAIL_REOPEN 40
+/* Frame-diff motion → yellow bbox (camera pixel coords, mapped to letterbox). */
+#define MOTION_DIFF_THRESH 18
+#define MOTION_MIN_PIXELS 12
+#define MOTION_HOLD_FRAMES 5
+#define MOTION_PAD_PX 6
 
 struct shm_buffer {
 	struct wl_buffer *wl_buffer;
@@ -87,6 +95,13 @@ struct cam_state {
 	size_t rgb_size;
 	unsigned rgb_w;
 	unsigned rgb_h;
+	/* Grayscale prev frame for absdiff; bbox in rgb_w×rgb_h coords. */
+	uint8_t *gray_prev;
+	size_t gray_size;
+	bool motion_have_prev;
+	bool motion_active;
+	int motion_x0, motion_y0, motion_x1, motion_y1;
+	unsigned motion_hold;
 };
 
 struct app {
@@ -287,7 +302,124 @@ static void cam_close(struct cam_state *cam)
 	cam->rgb = NULL;
 	cam->rgb_size = 0;
 	cam->rgb_w = cam->rgb_h = 0;
+	free(cam->gray_prev);
+	cam->gray_prev = NULL;
+	cam->gray_size = 0;
+	cam->motion_have_prev = false;
+	cam->motion_active = false;
+	cam->motion_hold = 0;
 	cam->have_frame = false;
+}
+
+static void cam_motion_reset(struct cam_state *cam)
+{
+	cam->motion_have_prev = false;
+	cam->motion_active = false;
+	cam->motion_hold = 0;
+}
+
+static bool cam_ensure_gray(struct cam_state *cam, unsigned w, unsigned h)
+{
+	size_t need = (size_t)w * (size_t)h;
+
+	if (cam->gray_prev && cam->gray_size >= need)
+		return true;
+	free(cam->gray_prev);
+	cam->gray_prev = malloc(need);
+	if (!cam->gray_prev) {
+		cam->gray_size = 0;
+		return false;
+	}
+	cam->gray_size = need;
+	cam_motion_reset(cam);
+	return true;
+}
+
+/* Absdiff gray vs previous; bbox of changed pixels (camera coords). */
+static void cam_motion_update(struct cam_state *cam)
+{
+	unsigned w = cam->rgb_w;
+	unsigned h = cam->rgb_h;
+	unsigned x, y;
+	int min_x, min_y, max_x, max_y;
+	unsigned count = 0;
+
+	if (!cam->rgb || w < 2 || h < 2)
+		return;
+	if (!cam_ensure_gray(cam, w, h))
+		return;
+
+	if (!cam->motion_have_prev) {
+		for (y = 0; y < h; y++) {
+			const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+			uint8_t *g = cam->gray_prev + (size_t)y * w;
+
+			for (x = 0; x < w; x++) {
+				const uint8_t *p = row + (size_t)x * 3u;
+				/* ITU-R BT.601 luma approx */
+				g[x] = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+			}
+		}
+		cam->motion_have_prev = true;
+		cam->motion_active = false;
+		cam->motion_hold = 0;
+		return;
+	}
+
+	min_x = (int)w;
+	min_y = (int)h;
+	max_x = -1;
+	max_y = -1;
+
+	for (y = 0; y < h; y++) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		uint8_t *gprev = cam->gray_prev + (size_t)y * w;
+
+		for (x = 0; x < w; x++) {
+			const uint8_t *p = row + (size_t)x * 3u;
+			uint8_t g = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+			unsigned d = g > gprev[x] ? (unsigned)(g - gprev[x])
+						  : (unsigned)(gprev[x] - g);
+
+			gprev[x] = g;
+			if (d < MOTION_DIFF_THRESH)
+				continue;
+			count++;
+			if ((int)x < min_x)
+				min_x = (int)x;
+			if ((int)x > max_x)
+				max_x = (int)x;
+			if ((int)y < min_y)
+				min_y = (int)y;
+			if ((int)y > max_y)
+				max_y = (int)y;
+		}
+	}
+
+	if (count >= MOTION_MIN_PIXELS && max_x >= min_x && max_y >= min_y) {
+		int pad = MOTION_PAD_PX;
+
+		cam->motion_x0 = min_x - pad;
+		cam->motion_y0 = min_y - pad;
+		cam->motion_x1 = max_x + pad;
+		cam->motion_y1 = max_y + pad;
+		if (cam->motion_x0 < 0)
+			cam->motion_x0 = 0;
+		if (cam->motion_y0 < 0)
+			cam->motion_y0 = 0;
+		if (cam->motion_x1 >= (int)w)
+			cam->motion_x1 = (int)w - 1;
+		if (cam->motion_y1 >= (int)h)
+			cam->motion_y1 = (int)h - 1;
+		cam->motion_active = true;
+		cam->motion_hold = MOTION_HOLD_FRAMES;
+	} else if (cam->motion_hold > 0) {
+		cam->motion_hold--;
+		if (cam->motion_hold == 0)
+			cam->motion_active = false;
+	} else {
+		cam->motion_active = false;
+	}
 }
 
 static int xioctl(int fd, unsigned long req, void *arg)
@@ -316,6 +448,7 @@ static bool cam_ensure_rgb(struct cam_state *cam, unsigned w, unsigned h)
 	cam->rgb_size = need;
 	cam->rgb_w = w;
 	cam->rgb_h = h;
+	cam_motion_reset(cam);
 	return true;
 }
 
@@ -688,6 +821,7 @@ static void cam_grab(struct cam_state *cam)
 		/* Keep last good frame on corrupt MJPEG; reopen if decode is stuck. */
 		if (ok) {
 			cam->decode_fails = 0;
+			cam_motion_update(cam);
 			snprintf(cam->status, sizeof(cam->status), "%s %ux%u %s",
 				 cam->device, cam->width, cam->height,
 				 cam->fmt == CAM_FMT_MJPEG ? "MJPEG" : "YUYV");
@@ -706,38 +840,55 @@ static void cam_grab(struct cam_state *cam)
 
 /* ---- draw --------------------------------------------------------------- */
 
-static void blit_rgb_letterbox(const uint8_t *rgb, unsigned sw, unsigned sh,
-			       uint32_t *dst, int dw, int dh, int top_pad)
+struct letterbox {
+	int x0, y0, vw, vh;
+};
+
+static void letterbox_geom(unsigned sw, unsigned sh, int dw, int dh, int top_pad,
+			   struct letterbox *lb)
 {
 	int view_h = dh - top_pad;
-	int x0, y0, vw, vh;
-	int y, x;
 
+	lb->x0 = lb->y0 = 0;
+	lb->vw = lb->vh = 0;
 	if (view_h < 1 || sw < 1 || sh < 1)
 		return;
 
-	/* Letterbox into area below status bar. */
 	if ((int64_t)sw * view_h > (int64_t)sh * dw) {
-		vw = dw;
-		vh = (int)((int64_t)sh * dw / sw);
+		lb->vw = dw;
+		lb->vh = (int)((int64_t)sh * dw / sw);
 	} else {
-		vh = view_h;
-		vw = (int)((int64_t)sw * view_h / sh);
+		lb->vh = view_h;
+		lb->vw = (int)((int64_t)sw * view_h / sh);
 	}
-	if (vw < 1)
-		vw = 1;
-	if (vh < 1)
-		vh = 1;
-	x0 = (dw - vw) / 2;
-	y0 = top_pad + (view_h - vh) / 2;
+	if (lb->vw < 1)
+		lb->vw = 1;
+	if (lb->vh < 1)
+		lb->vh = 1;
+	lb->x0 = (dw - lb->vw) / 2;
+	lb->y0 = top_pad + (view_h - lb->vh) / 2;
+}
 
-	for (y = 0; y < vh; y++) {
-		unsigned sy = (unsigned)((int64_t)y * sh / vh);
+static void blit_rgb_letterbox(const uint8_t *rgb, unsigned sw, unsigned sh,
+			       uint32_t *dst, int dw, int dh, int top_pad,
+			       struct letterbox *out_lb)
+{
+	struct letterbox lb;
+	int y, x;
+
+	letterbox_geom(sw, sh, dw, dh, top_pad, &lb);
+	if (out_lb)
+		*out_lb = lb;
+	if (lb.vw < 1 || lb.vh < 1)
+		return;
+
+	for (y = 0; y < lb.vh; y++) {
+		unsigned sy = (unsigned)((int64_t)y * sh / lb.vh);
 		const uint8_t *row = rgb + (size_t)sy * sw * 3u;
-		uint32_t *out = dst + (size_t)(y0 + y) * (size_t)dw + (size_t)x0;
+		uint32_t *out = dst + (size_t)(lb.y0 + y) * (size_t)dw + (size_t)lb.x0;
 
-		for (x = 0; x < vw; x++) {
-			unsigned sx = (unsigned)((int64_t)x * sw / vw);
+		for (x = 0; x < lb.vw; x++) {
+			unsigned sx = (unsigned)((int64_t)x * sw / lb.vw);
 			const uint8_t *p = row + (size_t)sx * 3u;
 			/* CAIRO_FORMAT_ARGB32 native: 0xAARRGGBB */
 			out[x] = 0xff000000u |
@@ -756,13 +907,31 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	const double w = b->width;
 	const double h = b->height;
 	char line[160];
+	struct letterbox lb = { 0 };
 
 	cairo_set_source_rgb(cr, 0.02, 0.02, 0.04);
 	cairo_paint(cr);
 
 	if (app->cam.have_frame && app->cam.rgb)
 		blit_rgb_letterbox(app->cam.rgb, app->cam.rgb_w, app->cam.rgb_h,
-				   (uint32_t *)b->data, b->width, b->height, STATUS_H);
+				   (uint32_t *)b->data, b->width, b->height, STATUS_H,
+				   &lb);
+
+	/* Yellow bbox where motion was detected (map camera → letterbox). */
+	if (app->cam.motion_active && lb.vw > 0 && lb.vh > 0 &&
+	    app->cam.rgb_w > 0 && app->cam.rgb_h > 0) {
+		double sx = (double)lb.vw / (double)app->cam.rgb_w;
+		double sy = (double)lb.vh / (double)app->cam.rgb_h;
+		double rx = lb.x0 + app->cam.motion_x0 * sx;
+		double ry = lb.y0 + app->cam.motion_y0 * sy;
+		double rw = (app->cam.motion_x1 - app->cam.motion_x0 + 1) * sx;
+		double rh = (app->cam.motion_y1 - app->cam.motion_y0 + 1) * sy;
+
+		cairo_set_source_rgb(cr, 1.0, 0.92, 0.1);
+		cairo_set_line_width(cr, 3.0);
+		cairo_rectangle(cr, rx, ry, rw, rh);
+		cairo_stroke(cr);
+	}
 
 	cairo_set_source_rgba(cr, 0.04, 0.07, 0.12, 0.92);
 	cairo_rectangle(cr, 0, 0, w, STATUS_H);
@@ -776,7 +945,8 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 			       CAIRO_FONT_WEIGHT_BOLD);
 	cairo_set_font_size(cr, 16);
 	cairo_set_source_rgb(cr, 0.85, 0.90, 0.95);
-	snprintf(line, sizeof(line), "Camera  ·  %s", app->cam.status);
+	snprintf(line, sizeof(line), "Camera  ·  %s%s", app->cam.status,
+		 app->cam.motion_active ? "  ·  motion" : "");
 	cairo_move_to(cr, 14, 24);
 	cairo_show_text(cr, line);
 

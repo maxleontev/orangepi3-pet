@@ -59,9 +59,11 @@ Fullscreen **info-panel-camera**: live preview from a USB UVC webcam (e.g. Logit
 
 - V4L2 MMAP capture; prefer **MJPEG** (libjpeg-turbo), fallback **YUYV**
 - Letterboxed onto the HDMI output with a thin status bar (device / size / format)
+- Simple **motion bbox**: grayscale frame-diff; yellow Cairo rectangle over the
+  changed region (held a few frames); status bar shows `motion` while active
 - Device: `INFO_PANEL_CAMERA_DEVICE=/dev/videoN` (default: first capture node)
 - Size hint: `INFO_PANEL_CAMERA_SIZE=WxH` (else tries 1280×720 … 640×480)
-- Redraw capped ~15 fps; same wl_shm busy-buffer rules as the stats panel
+- Redraw capped ~5 fps (`FRAME_MS=200`); same wl_shm busy-buffer rules as the stats panel
 - Kernel: `uvc.cfg` enables `CONFIG_MEDIA_USB_SUPPORT` + `CONFIG_USB_VIDEO_CLASS=m`
 
 ---
@@ -197,6 +199,7 @@ Meson + Wayland client (`info-panel-camera.c`) + `info-panel-camera.service`.
 
 - Installed when `INFO_PANEL = "camera"` in `local.conf`.
 - Live USB UVC preview (V4L2 + libjpeg-turbo MJPEG / YUYV).
+- Frame-diff motion → yellow bounding box on the moving region (Cairo; no OpenCV).
 - `SupplementaryGroups=wayland video`; weston user already in `video` via weston-init.
 - Installs shared `/usr/sbin/hdmi-screenshot` (same script as stats; signals
   whichever panel is running).
