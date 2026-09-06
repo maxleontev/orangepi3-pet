@@ -1,12 +1,12 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Max <max@localhost>
+From: Max Leontev <maxleontev@gmail.com>
 Date: Wed, 26 Aug 2026 14:00:00 +0800
 Subject: [PATCH] arm64: dts: allwinner: h6: enable HDMI audio on Orange Pi 3
 
 Wire I2S1 to the DW-HDMI codec as a simple-audio-card so ALSA can play
 through the monitor speakers.
 
-Signed-off-by: Max <max@localhost>
+Signed-off-by: Max Leontev <maxleontev@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts | 25 +++++++++++++++++++
  1 file changed, 25 insertions(+)

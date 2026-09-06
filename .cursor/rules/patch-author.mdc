@@ -1,0 +1,20 @@
+---
+description: Author email for project-owned *.patch files
+globs: "**/*.patch"
+alwaysApply: true
+---
+
+# Patch author identity
+
+When creating or editing any project-owned `*.patch` (especially under `meta-local/`):
+
+- Use **From:** and **Signed-off-by:** as `Max Leontev <maxleontev@gmail.com>`.
+- Never use `max@localhost` or other placeholder emails.
+- Do not rewrite author headers in upstream layers (`poky/`, `meta-sunxi/`, `meta-arm/`, …) unless the user asks.
+
+```diff
+-From: Max <max@localhost>
+-Signed-off-by: Max <max@localhost>
++From: Max Leontev <maxleontev@gmail.com>
++Signed-off-by: Max Leontev <maxleontev@gmail.com>
+```
