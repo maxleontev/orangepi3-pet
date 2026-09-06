@@ -9,4 +9,5 @@ SRC_URI:append:orange-pi-3 = " \
     file://0003-arm64-dts-sun50i-h6-orangepi-3-enable-AC200-codec.patch \
     file://0004-ASoC-AC200-Initial-driver.patch \
     file://0005-arm64-dts-sun50i-h6-orangepi-3-enable-HDMI-audio.patch \
+    file://0006-arm64-dts-sun50i-h6-orangepi-3-enable-PWM0-on-PD22.patch \
 "

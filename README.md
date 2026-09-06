@@ -76,6 +76,12 @@ Must run as root. After success: power off, remove the SD card, power on
 Dumps the live HDMI panel frame (last committed Wayland SHM buffer) to PNG.
 Installed by whichever panel recipe is in the image (`info-panel` or
 `info-panel-camera`). That panel process must be running.
+`info-panel-camera` also draws a yellow motion bbox (densest changed
+blob; ignores near-global frame shifts and settles after a servo pan)
+and, when a hobby servo is on CON12 pin 7 (HW PWM0 / PD22), pans to
+keep that bbox centered (`INFO_PANEL_SERVO=0` disables;
+`INFO_PANEL_SERVO_INVERT=1` flips pan direction from the camera-on-servo
+default).
 
 ```bash
 hdmi-screenshot                  # TTY: /tmp/hdmi-screenshot.png (prints path)

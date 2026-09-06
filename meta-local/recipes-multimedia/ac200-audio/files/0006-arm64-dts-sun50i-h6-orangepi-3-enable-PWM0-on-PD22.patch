@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Max Leontev <max@localhost>
+Date: Sun, 6 Sep 2026 14:56:00 +0800
+Subject: [PATCH] arm64: dts: sun50i-h6-orangepi-3: enable PWM0 on PD22
+
+CON12 pin 7 is PD22 / hardware PWM0. Mux it via pinctrl function "pwm"
+(H6 naming; channel 0) so sysfs pwmchip0/pwm0 drives the header pin.
+PWM1 on PB19 stays claimed by ac200_pwm_clk for the onboard codec.
+
+Signed-off-by: Max Leontev <max@localhost>
+---
+ arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts
+@@ -218,9 +218,17 @@
+ 	vcc-pc-supply = <&reg_bldo2>;
+ 	vcc-pd-supply = <&reg_cldo1>;
+ 	vcc-pg-supply = <&reg_vcc_wifi_io>;
++
++	/* CON12-P07: hardware PWM0 for hobby servos / external loads */
++	pwm0_pin: pwm0-pin {
++		pins = "PD22";
++		function = "pwm";
++	};
+ };
+ 
+ &pwm {
++	pinctrl-names = "default";
++	pinctrl-0 = <&pwm0_pin>;
+ 	status = "okay";
+ };
+ 

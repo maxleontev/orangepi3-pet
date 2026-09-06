@@ -20,6 +20,8 @@ Environment=INFO_PANEL_CAMERA_SIZE=320x240
 ExecStartPre=+/bin/sh -c 'i=0; while [ ! -S /run/wayland-0 ] && [ $i -lt 50 ]; do i=$((i+1)); sleep 0.2; done; [ -S /run/wayland-0 ]'
 ExecStartPre=+/bin/sh -c 'for n in /dev/video*; do [ -e "$n" ] || continue; chgrp video "$n" 2>/dev/null; chmod 660 "$n" 2>/dev/null; done; true'
 ExecStartPre=+/bin/sh -c 'echo -1 > /sys/module/usbcore/parameters/autosuspend 2>/dev/null; echo 128 > /sys/module/usbcore/parameters/usbfs_memory_mb 2>/dev/null; true'
+# Root: export HW PWM0 (PD22) and open duty/enable for weston motion tracking.
+ExecStartPre=+/bin/sh -c 'CHIP=/sys/class/pwm/pwmchip0; P=$CHIP/pwm0; [ -d "$CHIP" ] || exit 0; [ -d "$P" ] || echo 0 > $CHIP/export; i=0; while [ ! -e "$P/duty_cycle" ] && [ $i -lt 40 ]; do i=$((i+1)); sleep 0.05; done; chmod 666 "$P/duty_cycle" "$P/enable" "$P/period" "$P/polarity" 2>/dev/null; true'
 ExecStart=/usr/bin/info-panel-camera
 Restart=on-failure
 RestartSec=2

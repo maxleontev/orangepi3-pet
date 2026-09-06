@@ -6,8 +6,15 @@
  * Device: INFO_PANEL_CAMERA_DEVICE, else first /dev/video* with CAPTURE.
  * Size hint: INFO_PANEL_CAMERA_SIZE=WxH (default try 1280x720 … 640x480).
  *
- * Motion: frame-diff on grayscale (no OpenCV). Yellow Cairo bbox where
- * pixels changed; held a few frames so it stays visible at ~5 fps.
+ * Motion: frame-diff on grayscale (no OpenCV). Yellow Cairo bbox around
+ * the densest changed blob (not min/max of all noise). Rejects near-global
+ * frame changes and settles after servo pan so ego-motion does not fill
+ * the screen. Held a few frames so it stays visible at ~5 fps.
+ *
+ * Servo pan (optional): HW PWM0 on PD22 (CON12 pin 7) keeps the bbox
+ * centered horizontally when the camera is mounted on the servo.
+ * Disable with INFO_PANEL_SERVO=0; flip direction with INFO_PANEL_SERVO_INVERT=1
+ * (default pan matches camera mounted on the servo).
  *
  * Lessons from info-panel on this H6 board: never attach a busy wl_shm
  * buffer; poll with a real timeout; cap redraw rate (FRAME_MS).
@@ -50,10 +57,28 @@
 #define STATUS_H 36
 #define DECODE_FAIL_REOPEN 40
 /* Frame-diff motion → yellow bbox (camera pixel coords, mapped to letterbox). */
-#define MOTION_DIFF_THRESH 18
-#define MOTION_MIN_PIXELS 12
-#define MOTION_HOLD_FRAMES 5
-#define MOTION_PAD_PX 6
+#define MOTION_DIFF_THRESH 14
+#define MOTION_MIN_PIXELS 8
+#define MOTION_HOLD_FRAMES 25
+#define MOTION_PAD_PX 8
+/* Reject near-full-frame changes (AE / hard ego-pan); keep prior bbox if any. */
+#define MOTION_MAX_FRAC_PCT 40
+/* Coarse grid: prefer densest blob; fall back to full mask extent. */
+#define MOTION_GRID 16
+/* Cap AE mean subtraction so local motion is not cancelled. */
+#define MOTION_MEAN_CAP 10
+/* After a pan, skip motion/servo for N frames while gray re-seeds (~1 s). */
+#define MOTION_SETTLE_FRAMES 5
+/* Pan servo on pwmchip0/pwm0 (PD22). Period 20 ms; pulse 1.0–2.0 ms. */
+#define SERVO_PWM_CHIP "/sys/class/pwm/pwmchip0"
+#define SERVO_PWM_PATH "/sys/class/pwm/pwmchip0/pwm0"
+#define SERVO_PERIOD_NS 20000000L
+#define SERVO_DUTY_MIN_NS 1000000L
+#define SERVO_DUTY_MAX_NS 2000000L
+#define SERVO_DUTY_CENTER_NS 1500000L
+#define SERVO_DEADZONE_PX 12
+#define SERVO_GAIN_NS_PER_PX 2500L
+#define SERVO_MAX_STEP_NS 80000L
 
 struct shm_buffer {
 	struct wl_buffer *wl_buffer;
@@ -98,10 +123,21 @@ struct cam_state {
 	/* Grayscale prev frame for absdiff; bbox in rgb_w×rgb_h coords. */
 	uint8_t *gray_prev;
 	size_t gray_size;
+	uint8_t *motion_mask;
+	size_t mask_size;
 	bool motion_have_prev;
 	bool motion_active;
 	int motion_x0, motion_y0, motion_x1, motion_y1;
 	unsigned motion_hold;
+	/* After a pan, skip bbox until the background is stable again. */
+	unsigned motion_settle;
+};
+
+struct servo_state {
+	bool enabled;
+	bool ready;
+	int pan_sign; /* +1: object on right → increase duty */
+	long duty_ns;
 };
 
 struct app {
@@ -124,6 +160,7 @@ struct app {
 	int last_committed;
 	bool have_committed;
 	struct cam_state cam;
+	struct servo_state servo;
 	bool frame_dirty;
 };
 
@@ -305,9 +342,13 @@ static void cam_close(struct cam_state *cam)
 	free(cam->gray_prev);
 	cam->gray_prev = NULL;
 	cam->gray_size = 0;
+	free(cam->motion_mask);
+	cam->motion_mask = NULL;
+	cam->mask_size = 0;
 	cam->motion_have_prev = false;
 	cam->motion_active = false;
 	cam->motion_hold = 0;
+	cam->motion_settle = 0;
 	cam->have_frame = false;
 }
 
@@ -316,33 +357,87 @@ static void cam_motion_reset(struct cam_state *cam)
 	cam->motion_have_prev = false;
 	cam->motion_active = false;
 	cam->motion_hold = 0;
+	cam->motion_settle = 0;
+}
+
+static void cam_fill_gray(struct cam_state *cam, unsigned w, unsigned h)
+{
+	unsigned x, y;
+
+	for (y = 0; y < h; y++) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		uint8_t *g = cam->gray_prev + (size_t)y * w;
+
+		for (x = 0; x < w; x++) {
+			const uint8_t *p = row + (size_t)x * 3u;
+			/* ITU-R BT.601 luma approx */
+			g[x] = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+		}
+	}
 }
 
 static bool cam_ensure_gray(struct cam_state *cam, unsigned w, unsigned h)
 {
 	size_t need = (size_t)w * (size_t)h;
 
-	if (cam->gray_prev && cam->gray_size >= need)
+	if (cam->gray_prev && cam->gray_size >= need &&
+	    cam->motion_mask && cam->mask_size >= need)
 		return true;
 	free(cam->gray_prev);
+	free(cam->motion_mask);
 	cam->gray_prev = malloc(need);
-	if (!cam->gray_prev) {
+	cam->motion_mask = malloc(need);
+	if (!cam->gray_prev || !cam->motion_mask) {
+		free(cam->gray_prev);
+		free(cam->motion_mask);
+		cam->gray_prev = NULL;
+		cam->motion_mask = NULL;
 		cam->gray_size = 0;
+		cam->mask_size = 0;
 		return false;
 	}
 	cam->gray_size = need;
+	cam->mask_size = need;
 	cam_motion_reset(cam);
 	return true;
 }
 
-/* Absdiff gray vs previous; bbox of changed pixels (camera coords). */
+static void cam_motion_hold_tick(struct cam_state *cam)
+{
+	if (cam->motion_hold > 0) {
+		cam->motion_hold--;
+		if (cam->motion_hold == 0)
+			cam->motion_active = false;
+	} else {
+		cam->motion_active = false;
+	}
+}
+
+/*
+ * Absdiff gray vs previous. Prefer a local dense blob over the global
+ * extent of every changed pixel (which balloons on AE / residual pan).
+ */
 static void cam_motion_update(struct cam_state *cam)
 {
 	unsigned w = cam->rgb_w;
 	unsigned h = cam->rgb_h;
 	unsigned x, y;
-	int min_x, min_y, max_x, max_y;
 	unsigned count = 0;
+	unsigned max_pix;
+	uint16_t cell[MOTION_GRID][MOTION_GRID];
+	uint8_t visit[MOTION_GRID][MOTION_GRID];
+	int stack_x[MOTION_GRID * MOTION_GRID];
+	int stack_y[MOTION_GRID * MOTION_GRID];
+	int sp;
+	int seed_cx, seed_cy;
+	unsigned seed_hits, cell_thresh;
+	int cell_x0, cell_y0, cell_x1, cell_y1;
+	int min_x, min_y, max_x, max_y;
+	unsigned cw, ch;
+	int pad;
+	long sum_s = 0;
+	unsigned n_sub = 0;
+	int mean_s;
 
 	if (!cam->rgb || w < 2 || h < 2)
 		return;
@@ -350,75 +445,347 @@ static void cam_motion_update(struct cam_state *cam)
 		return;
 
 	if (!cam->motion_have_prev) {
-		for (y = 0; y < h; y++) {
-			const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
-			uint8_t *g = cam->gray_prev + (size_t)y * w;
-
-			for (x = 0; x < w; x++) {
-				const uint8_t *p = row + (size_t)x * 3u;
-				/* ITU-R BT.601 luma approx */
-				g[x] = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
-			}
-		}
+		cam_fill_gray(cam, w, h);
 		cam->motion_have_prev = true;
 		cam->motion_active = false;
 		cam->motion_hold = 0;
 		return;
 	}
 
-	min_x = (int)w;
-	min_y = (int)h;
-	max_x = -1;
-	max_y = -1;
+	/* After pan: re-seed gray, do not chase ego-motion as an "object". */
+	if (cam->motion_settle > 0) {
+		cam_fill_gray(cam, w, h);
+		cam->motion_settle--;
+		cam->motion_active = false;
+		cam->motion_hold = 0;
+		return;
+	}
+
+	/* Subsample mean signed Δ to cancel global AE / exposure shifts. */
+	for (y = 0; y < h; y += 4) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		const uint8_t *gprev = cam->gray_prev + (size_t)y * w;
+
+		for (x = 0; x < w; x += 4) {
+			const uint8_t *p = row + (size_t)x * 3u;
+			uint8_t g = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+
+			sum_s += (int)g - (int)gprev[x];
+			n_sub++;
+		}
+	}
+	mean_s = n_sub ? (int)(sum_s / (long)n_sub) : 0;
+	if (mean_s > MOTION_MEAN_CAP)
+		mean_s = MOTION_MEAN_CAP;
+	else if (mean_s < -MOTION_MEAN_CAP)
+		mean_s = -MOTION_MEAN_CAP;
+
+	memset(cam->motion_mask, 0, (size_t)w * (size_t)h);
+	memset(cell, 0, sizeof(cell));
+	cw = (w + MOTION_GRID - 1) / MOTION_GRID;
+	ch = (h + MOTION_GRID - 1) / MOTION_GRID;
+	if (cw < 1)
+		cw = 1;
+	if (ch < 1)
+		ch = 1;
 
 	for (y = 0; y < h; y++) {
 		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
 		uint8_t *gprev = cam->gray_prev + (size_t)y * w;
+		uint8_t *mask = cam->motion_mask + (size_t)y * w;
+		unsigned cy = y / ch;
 
+		if (cy >= MOTION_GRID)
+			cy = MOTION_GRID - 1;
 		for (x = 0; x < w; x++) {
 			const uint8_t *p = row + (size_t)x * 3u;
 			uint8_t g = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
-			unsigned d = g > gprev[x] ? (unsigned)(g - gprev[x])
-						  : (unsigned)(gprev[x] - g);
+			int delta = (int)g - (int)gprev[x] - mean_s;
+			unsigned resid = delta < 0 ? (unsigned)(-delta) : (unsigned)delta;
+			unsigned cx_cell;
 
 			gprev[x] = g;
-			if (d < MOTION_DIFF_THRESH)
+			if (resid < MOTION_DIFF_THRESH)
 				continue;
+			mask[x] = 1;
 			count++;
-			if ((int)x < min_x)
-				min_x = (int)x;
-			if ((int)x > max_x)
-				max_x = (int)x;
-			if ((int)y < min_y)
-				min_y = (int)y;
-			if ((int)y > max_y)
-				max_y = (int)y;
+			cx_cell = x / cw;
+			if (cx_cell >= MOTION_GRID)
+				cx_cell = MOTION_GRID - 1;
+			cell[cy][cx_cell]++;
 		}
 	}
 
-	if (count >= MOTION_MIN_PIXELS && max_x >= min_x && max_y >= min_y) {
-		int pad = MOTION_PAD_PX;
+	max_pix = (unsigned)(((unsigned long)w * (unsigned long)h *
+			      (unsigned long)MOTION_MAX_FRAC_PCT) / 100ul);
+	if (count > max_pix) {
+		/*
+		 * Near-global change (servo lag / AE). Do not drop an active
+		 * yellow box — just keep the last bbox until local motion returns.
+		 */
+		if (!cam->motion_active)
+			cam_motion_hold_tick(cam);
+		return;
+	}
+	if (count < MOTION_MIN_PIXELS) {
+		cam_motion_hold_tick(cam);
+		return;
+	}
 
-		cam->motion_x0 = min_x - pad;
-		cam->motion_y0 = min_y - pad;
-		cam->motion_x1 = max_x + pad;
-		cam->motion_y1 = max_y + pad;
-		if (cam->motion_x0 < 0)
-			cam->motion_x0 = 0;
-		if (cam->motion_y0 < 0)
-			cam->motion_y0 = 0;
-		if (cam->motion_x1 >= (int)w)
-			cam->motion_x1 = (int)w - 1;
-		if (cam->motion_y1 >= (int)h)
-			cam->motion_y1 = (int)h - 1;
-		cam->motion_active = true;
-		cam->motion_hold = MOTION_HOLD_FRAMES;
-	} else if (cam->motion_hold > 0) {
-		cam->motion_hold--;
-		if (cam->motion_hold == 0)
-			cam->motion_active = false;
-	} else {
+	seed_cx = seed_cy = 0;
+	seed_hits = 0;
+	for (y = 0; y < MOTION_GRID; y++) {
+		for (x = 0; x < MOTION_GRID; x++) {
+			if (cell[y][x] > seed_hits) {
+				seed_hits = cell[y][x];
+				seed_cx = (int)x;
+				seed_cy = (int)y;
+			}
+		}
+	}
+	if (seed_hits == 0) {
+		cam_motion_hold_tick(cam);
+		return;
+	}
+
+	cell_thresh = seed_hits / 6u;
+	if (cell_thresh < 1u)
+		cell_thresh = 1u;
+
+	memset(visit, 0, sizeof(visit));
+	sp = 0;
+	stack_x[sp] = seed_cx;
+	stack_y[sp] = seed_cy;
+	sp++;
+	visit[seed_cy][seed_cx] = 1;
+	cell_x0 = cell_x1 = seed_cx;
+	cell_y0 = cell_y1 = seed_cy;
+
+	while (sp > 0) {
+		int cx_cell, cy_cell;
+		static const int dx[4] = { 1, -1, 0, 0 };
+		static const int dy[4] = { 0, 0, 1, -1 };
+		int k;
+
+		sp--;
+		cx_cell = stack_x[sp];
+		cy_cell = stack_y[sp];
+		if (cx_cell < cell_x0)
+			cell_x0 = cx_cell;
+		if (cx_cell > cell_x1)
+			cell_x1 = cx_cell;
+		if (cy_cell < cell_y0)
+			cell_y0 = cy_cell;
+		if (cy_cell > cell_y1)
+			cell_y1 = cy_cell;
+		for (k = 0; k < 4; k++) {
+			int nx = cx_cell + dx[k];
+			int ny = cy_cell + dy[k];
+
+			if (nx < 0 || ny < 0 || nx >= MOTION_GRID || ny >= MOTION_GRID)
+				continue;
+			if (visit[ny][nx] || cell[ny][nx] < cell_thresh)
+				continue;
+			visit[ny][nx] = 1;
+			stack_x[sp] = nx;
+			stack_y[sp] = ny;
+			sp++;
+		}
+	}
+
+	min_x = (int)w;
+	min_y = (int)h;
+	max_x = -1;
+	max_y = -1;
+	{
+		unsigned x0 = (unsigned)cell_x0 * cw;
+		unsigned y0 = (unsigned)cell_y0 * ch;
+		unsigned x1 = (unsigned)(cell_x1 + 1) * cw;
+		unsigned y1 = (unsigned)(cell_y1 + 1) * ch;
+
+		if (x1 > w)
+			x1 = w;
+		if (y1 > h)
+			y1 = h;
+		for (y = y0; y < y1; y++) {
+			const uint8_t *mask = cam->motion_mask + (size_t)y * w;
+
+			for (x = x0; x < x1; x++) {
+				if (!mask[x])
+					continue;
+				if ((int)x < min_x)
+					min_x = (int)x;
+				if ((int)x > max_x)
+					max_x = (int)x;
+				if ((int)y < min_y)
+					min_y = (int)y;
+				if ((int)y > max_y)
+					max_y = (int)y;
+			}
+		}
+	}
+
+	/* Sparse / weak cluster: still show extent of all changed pixels. */
+	if (max_x < min_x || max_y < min_y) {
+		min_x = (int)w;
+		min_y = (int)h;
+		max_x = -1;
+		max_y = -1;
+		for (y = 0; y < h; y++) {
+			const uint8_t *mask = cam->motion_mask + (size_t)y * w;
+
+			for (x = 0; x < w; x++) {
+				if (!mask[x])
+					continue;
+				if ((int)x < min_x)
+					min_x = (int)x;
+				if ((int)x > max_x)
+					max_x = (int)x;
+				if ((int)y < min_y)
+					min_y = (int)y;
+				if ((int)y > max_y)
+					max_y = (int)y;
+			}
+		}
+	}
+
+	if (max_x < min_x || max_y < min_y) {
+		cam_motion_hold_tick(cam);
+		return;
+	}
+
+	pad = MOTION_PAD_PX;
+	cam->motion_x0 = min_x - pad;
+	cam->motion_y0 = min_y - pad;
+	cam->motion_x1 = max_x + pad;
+	cam->motion_y1 = max_y + pad;
+	if (cam->motion_x0 < 0)
+		cam->motion_x0 = 0;
+	if (cam->motion_y0 < 0)
+		cam->motion_y0 = 0;
+	if (cam->motion_x1 >= (int)w)
+		cam->motion_x1 = (int)w - 1;
+	if (cam->motion_y1 >= (int)h)
+		cam->motion_y1 = (int)h - 1;
+	cam->motion_active = true;
+	cam->motion_hold = MOTION_HOLD_FRAMES;
+}
+
+static int servo_write_str(const char *path, const char *val)
+{
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, val, strlen(val));
+	close(fd);
+	return (n < 0) ? -1 : 0;
+}
+
+static int servo_write_ll(const char *path, long long v)
+{
+	char buf[32];
+
+	snprintf(buf, sizeof(buf), "%lld", v);
+	return servo_write_str(path, buf);
+}
+
+static void servo_close(struct servo_state *sv)
+{
+	if (!sv->ready)
+		return;
+	servo_write_str(SERVO_PWM_PATH "/enable", "0");
+	sv->ready = false;
+}
+
+static bool servo_init(struct servo_state *sv)
+{
+	const char *env = getenv("INFO_PANEL_SERVO");
+	const char *inv = getenv("INFO_PANEL_SERVO_INVERT");
+
+	memset(sv, 0, sizeof(*sv));
+	sv->pan_sign = -1; /* camera-on-servo: object on right → decrease duty */
+	sv->duty_ns = SERVO_DUTY_CENTER_NS;
+	if (env && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' ||
+		    env[0] == 'f' || env[0] == 'F')) {
+		sv->enabled = false;
+		return false;
+	}
+	sv->enabled = true;
+	if (inv && inv[0] && inv[0] != '0' && inv[0] != 'n' && inv[0] != 'N' &&
+	    inv[0] != 'f' && inv[0] != 'F')
+		sv->pan_sign = -sv->pan_sign;
+
+	if (access(SERVO_PWM_PATH "/period", F_OK) != 0) {
+		if (servo_write_str(SERVO_PWM_CHIP "/export", "0") < 0) {
+			fprintf(stderr,
+				"info-panel-camera: servo pwm0 missing (need root export)\n");
+			sv->enabled = false;
+			return false;
+		}
+		usleep(50000);
+	}
+	servo_write_str(SERVO_PWM_PATH "/enable", "0");
+	if (servo_write_ll(SERVO_PWM_PATH "/period", SERVO_PERIOD_NS) < 0 ||
+	    servo_write_ll(SERVO_PWM_PATH "/duty_cycle", SERVO_DUTY_CENTER_NS) < 0) {
+		fprintf(stderr, "info-panel-camera: servo pwm setup failed\n");
+		sv->enabled = false;
+		return false;
+	}
+	servo_write_str(SERVO_PWM_PATH "/polarity", "normal");
+	if (servo_write_str(SERVO_PWM_PATH "/enable", "1") < 0) {
+		fprintf(stderr, "info-panel-camera: servo pwm enable failed\n");
+		sv->enabled = false;
+		return false;
+	}
+	sv->ready = true;
+	sv->duty_ns = SERVO_DUTY_CENTER_NS;
+	fprintf(stderr, "info-panel-camera: servo pan on %s (sign=%d)\n",
+		SERVO_PWM_PATH, sv->pan_sign);
+	return true;
+}
+
+/*
+ * Keep yellow-bbox center on the optical axis (horizontal only).
+ * Object right of frame center → pan camera right (duty += pan_sign * …).
+ */
+static void servo_follow_motion(struct servo_state *sv, struct cam_state *cam)
+{
+	int cx, err;
+	long step, duty;
+
+	if (!sv->enabled || !sv->ready || !cam->motion_active)
+		return;
+	if (cam->motion_settle > 0)
+		return;
+	if (cam->rgb_w < 2)
+		return;
+
+	cx = (cam->motion_x0 + cam->motion_x1) / 2;
+	err = cx - (int)cam->rgb_w / 2;
+	if (err > -SERVO_DEADZONE_PX && err < SERVO_DEADZONE_PX)
+		return;
+
+	step = sv->pan_sign * (long)err * SERVO_GAIN_NS_PER_PX;
+	if (step > SERVO_MAX_STEP_NS)
+		step = SERVO_MAX_STEP_NS;
+	else if (step < -SERVO_MAX_STEP_NS)
+		step = -SERVO_MAX_STEP_NS;
+
+	duty = sv->duty_ns + step;
+	if (duty < SERVO_DUTY_MIN_NS)
+		duty = SERVO_DUTY_MIN_NS;
+	else if (duty > SERVO_DUTY_MAX_NS)
+		duty = SERVO_DUTY_MAX_NS;
+	if (duty == sv->duty_ns)
+		return;
+	if (servo_write_ll(SERVO_PWM_PATH "/duty_cycle", duty) == 0) {
+		sv->duty_ns = duty;
+		/* Re-seed motion after ego-pan so the whole frame is not a "blob". */
+		cam->motion_settle = MOTION_SETTLE_FRAMES;
 		cam->motion_active = false;
+		cam->motion_hold = 0;
 	}
 }
 
@@ -945,8 +1312,9 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 			       CAIRO_FONT_WEIGHT_BOLD);
 	cairo_set_font_size(cr, 16);
 	cairo_set_source_rgb(cr, 0.85, 0.90, 0.95);
-	snprintf(line, sizeof(line), "Camera  ·  %s%s", app->cam.status,
-		 app->cam.motion_active ? "  ·  motion" : "");
+	snprintf(line, sizeof(line), "Camera  ·  %s%s%s", app->cam.status,
+		 app->cam.motion_active ? "  ·  motion" : "",
+		 (app->servo.ready && app->cam.motion_active) ? "  ·  track" : "");
 	cairo_move_to(cr, 14, 24);
 	cairo_show_text(cr, line);
 
@@ -1194,6 +1562,7 @@ int main(int argc, char **argv)
 
 	cam_find_and_open(&app.cam);
 	app.cam.next_retry_ms = monotonic_ms() + CAM_RETRY_MS;
+	servo_init(&app.servo);
 
 	while (app.running) {
 		uint64_t now_ms;
@@ -1243,9 +1612,10 @@ int main(int argc, char **argv)
 		now_ms = monotonic_ms();
 		grab_due = app.configured && (now_ms - last_frame_ms) >= FRAME_MS;
 
-		if (app.cam.fd >= 0 && grab_due)
+		if (app.cam.fd >= 0 && grab_due) {
 			cam_grab(&app.cam);
-		else if (app.cam.fd < 0 && now_ms >= app.cam.next_retry_ms) {
+			servo_follow_motion(&app.servo, &app.cam);
+		} else if (app.cam.fd < 0 && now_ms >= app.cam.next_retry_ms) {
 			bool ok = cam_find_and_open(&app.cam);
 
 			app.cam.next_retry_ms = monotonic_ms() +
@@ -1289,6 +1659,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	servo_close(&app.servo);
 	cam_close(&app.cam);
 	for (int i = 0; i < 2; i++)
 		shm_buffer_destroy(&app.buffers[i]);
