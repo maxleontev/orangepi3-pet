@@ -52,23 +52,7 @@ Weston):
 - Include **HDMI screenshots** in those updates, not only text.
 - **How the user sees images in Cursor Agents chat:**
   1. Capture PNG under `build-orangepi3/tmp/…` when debugging the **board**.
-     For **chat-display self-tests only**, reuse existing local PNGs under
-     `build-orangepi3/tmp/*.png` or `~/.cursor/projects/…/assets/` — do
-     **not** SSH/`pull-hdmi-screenshot` just to exercise chat rendering.
-  2. Call **`GenerateImage`** with
-     `reference_image_paths: [<absolute local PNG path>]` (writes under
-     `~/.cursor/projects/…/assets/`).
-  3. In the **same assistant reply**, embed the absolute asset path with
-     an HTML tag (this is what Cursor’s generate-image tool tells the
-     model to do for chat display):
-     `<img src="/absolute/path/to/assets/….png" alt="HDMI" />`
-     Density must stay **`detailed`** — see **Required Cursor chat
-     settings** above (and `.vscode/settings.json` in this repo).
-  4. **Self-check:** screenshot the Cursor Agents window
-     (`import -window … build-orangepi3/tmp/cursor-ide.png`), `Read` it,
-     and confirm the frame is in the **center chat column**. Do not claim
-     success until that check passes.
-  5. Do **not** rely on markdown `![](…)`, `Read`, or the right-panel
+  2. Do **not** rely on markdown `![](…)`, `Read`, or the right-panel
      `open_resource` as the way to show board shots in chat.
 - **Debug media location:** save temporary host-side screenshots,
   camera stills, and debug videos under `build-orangepi3/tmp/`
