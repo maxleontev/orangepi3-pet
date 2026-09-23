@@ -4,6 +4,61 @@ This repository contains a Yocto Project setup for building a custom Linux
 distribution for the **Orange Pi 3** single-board computer (image
 `core-image-khepri`).
 
+## First-time setup
+
+After a clone, two local files are missing on purpose (they are gitignored)
+and the board does not yet run this image. Create the files, build in
+`build-orangepi3/`, and write the WIC image to an SD card. Later updates go
+over SSH; that path is not the first flash.
+
+1. Create the root SSH key
+   ([`gen-root-ssh-key.sh`](meta-local/scripts/README.md#gen-root-ssh-key)).
+   The image installs the public half as root's `authorized_keys`. SSH is
+   key-only.
+
+2. Create the console password
+   ([`gen-khepri-passwd.sh`](meta-local/scripts/README.md#gen-khepri-passwd)).
+   The image recipe refuses to parse until
+   `meta-local/recipes-core/images/khepri-user-passwd.inc` exists. The same
+   password is set for `root` and user `max`. Console login is `root` with
+   that password. Do not commit the file.
+
+3. Install the host packages required to build:
+
+```bash
+sudo apt install -y build-essential gawk wget git-core diffstat unzip texinfo \
+  chrpath socat cpio python3 python3-pip python3-pexpect xz-utils debianutils \
+  iputils-ping python3-git python3-jinja2 python3-subunit zstd liblz4-tool \
+  file locales ca-certificates
+```
+
+4. Build. Poky, the layers, and `build-orangepi3/conf/` are already in the
+   clone, including
+   `require conf/distro/include/orangepi3-graphics.inc`. Do not create a
+   second build directory.
+
+```bash
+source poky/oe-init-build-env build-orangepi3
+bitbake core-image-khepri
+```
+
+5. Flash the deployed `.wic.gz` to an SD card with
+   [`cp_d`](meta-local/scripts/README.md#cp_d) (`DEST` defaults to
+   `/dev/sda`). Insert the card and power on.
+
+6. On first boot `/data` has no Wi-Fi networks, so the board opens the setup
+   AP (`Khepri-Setup-<mac4>`, `http://192.168.4.1/`). Save a network there;
+   see [WiFi](meta-local/recipes-wifi/README.md#setup-web-ui). After it joins
+   the LAN, SSH to `root@192.168.3.71` with the key from step 1.
+
+7. To move the install onto onboard eMMC, run
+   [`sd-to-emmc`](#sd-to-emmc) from the booted SD system, power off, remove
+   the card, and power on.
+
+After this, rebuilds are flashed with
+[`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update), which
+needs the board already up and reachable by SSH.
+
 ## Scripts
 
 Host-side helpers live under [`meta-local/scripts/`](meta-local/scripts/) —
@@ -122,14 +177,12 @@ fw_printenv -n bootslot
 
 ## Build & flash
 
-`local.conf` must include the graphics distro fragment:
+First clone, first SD flash, and moving the system to eMMC are in
+[First-time setup](#first-time-setup). `build-orangepi3/conf/local.conf`
+already includes `conf/distro/include/orangepi3-graphics.inc`.
 
-```bash
-# build-orangepi3/conf/local.conf
-require conf/distro/include/orangepi3-graphics.inc
-```
-
-Then build (`bitbake core-image-khepri`) and flash with
+Once the board is up, rebuild with `bitbake core-image-khepri` in
+`build-orangepi3/` and flash with
 [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update).
 
 Expect a larger rootfs than a WiFi-only image (Weston, Mesa, fonts, DRM modules).

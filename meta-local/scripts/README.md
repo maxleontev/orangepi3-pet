@@ -199,9 +199,3 @@ Requires `sudo` for `dd`. Override target with `DEST=/dev/sdX` or deploy dir wit
 
 Wipes a block device with zeros (default `/dev/sda`). Destructive; requires
 `sudo`. Override with `DEST=/dev/sdX`.
-
-<a id="instll"></a>
-## `instll`
-
-Commented notes for host package install and cloning Poky / OE / meta-sunxi /
-meta-arm (scarthgap).
