@@ -6,6 +6,33 @@ repository root (paths below are relative to the repo root).
 On-target tools (`ab-update`, `ab-confirm`, `hdmi-screenshot`, …) are
 documented in the top-level [README](../../README.md#scripts).
 
+<a id="gen-root-ssh-key"></a>
+## `gen-root-ssh-key.sh`
+
+Writes the local root SSH key used by the host scripts and by the
+`root-ssh-keys` recipe. The three files are gitignored:
+
+- `meta-local/recipes-core/root-ssh-keys/files/id_ed25519`
+- `meta-local/recipes-core/root-ssh-keys/files/id_ed25519.pub`
+- `meta-local/recipes-core/root-ssh-keys/files/authorized_keys`
+
+`authorized_keys` is a copy of the public key. The image installs only that
+file; the private key stays on the host. Run this once after a fresh clone,
+before `bitbake` or any script that SSHs to the board. Replacing an existing
+key needs `FORCE=1`. The board keeps the previous key until the image is
+rebuilt and flashed.
+
+```bash
+meta-local/scripts/gen-root-ssh-key.sh
+FORCE=1 meta-local/scripts/gen-root-ssh-key.sh
+```
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `KEY_DIR` | `meta-local/recipes-core/root-ssh-keys/files` | Directory for the three files |
+| `KEY_COMMENT` | `root@orange-pi-3` | Comment on the public key |
+| `FORCE` | `0` | `1` replaces files that already exist |
+
 <a id="make-ab-update-bundle"></a>
 ## `make-ab-update-bundle.sh`
 

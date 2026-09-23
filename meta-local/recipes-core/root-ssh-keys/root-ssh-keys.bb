@@ -5,6 +5,8 @@ directory for host clients and is not installed on the image."
 LICENSE = "MIT"
 LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
 
+# id_ed25519, id_ed25519.pub, and authorized_keys are local and gitignored.
+# Create them with meta-local/scripts/gen-root-ssh-key.sh before building.
 SRC_URI = "file://authorized_keys"
 
 S = "${WORKDIR}"

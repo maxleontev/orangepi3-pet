@@ -1,3 +1,6 @@
 # Python bytecode / cache (e.g. WIC plugins under meta-local/lib)
 *.pyc
 __pycache__/
+
+# Local root SSH key (meta-local/scripts/README.md#gen-root-ssh-key)
+meta-local/recipes-core/root-ssh-keys/files/
