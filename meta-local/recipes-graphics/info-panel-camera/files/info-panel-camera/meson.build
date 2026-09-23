@@ -32,4 +32,5 @@ executable(
   xdg_shell_private_code,
   dependencies: [wayland_client, cairo, jpeg],
   install: true,
+  link_args: ['-lm'],
 )

@@ -7,14 +7,13 @@
  * Size hint: INFO_PANEL_CAMERA_SIZE=WxH (default try 1280x720 … 640x480).
  *
  * Motion: frame-diff on grayscale (no OpenCV). Yellow Cairo bbox around
- * the densest changed blob (not min/max of all noise). Rejects near-global
- * frame changes and settles after servo pan so ego-motion does not fill
- * the screen. Held a few frames so it stays visible at ~5 fps.
+ * the densest changed blob. Near-global frame changes are ignored; after a
+ * servo pan, MOTION_SETTLE pauses *measurements* (re-seed gray) while EMA +
+ * lead-Kalman tracking and PID pan continue on the last estimate.
  *
- * Servo pan (optional): HW PWM0 on PD22 (CON12 pin 7) keeps the bbox
- * centered horizontally when the camera is mounted on the servo.
- * Disable with INFO_PANEL_SERVO=0; flip direction with INFO_PANEL_SERVO_INVERT=1
- * (default pan matches camera mounted on the servo).
+ * Servo pan (optional): HW PWM0 on PD22 (CON12 pin 7). Horizontal PID on the
+ * predicted bbox center (EMA → 1D CV Kalman → lead). Disable with
+ * INFO_PANEL_SERVO=0; flip with INFO_PANEL_SERVO_INVERT=1.
  *
  * Lessons from info-panel on this H6 board: never attach a busy wl_shm
  * buffer; poll with a real timeout; cap redraw rate (FRAME_MS).
@@ -42,6 +41,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <math.h>
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 
@@ -57,18 +57,37 @@
 #define STATUS_H 36
 #define DECODE_FAIL_REOPEN 40
 /* Frame-diff motion → yellow bbox (camera pixel coords, mapped to letterbox). */
-#define MOTION_DIFF_THRESH 14
-#define MOTION_MIN_PIXELS 8
-#define MOTION_HOLD_FRAMES 25
+#define MOTION_DIFF_THRESH 18
+#define MOTION_MIN_PIXELS 48
+#define MOTION_MIN_SEED_HITS 18
+#define MOTION_HOLD_FRAMES 12
 #define MOTION_PAD_PX 8
-/* Reject near-full-frame changes (AE / hard ego-pan); keep prior bbox if any. */
-#define MOTION_MAX_FRAC_PCT 40
+/* Reject near-full-frame changes (AE / hard ego-pan). */
+#define MOTION_MAX_FRAC_PCT 25
+/* Reject blob bbox larger than this fraction of the frame (noise/AE). */
+#define MOTION_MAX_BBOX_AREA_PCT 20
 /* Coarse grid: prefer densest blob; fall back to full mask extent. */
 #define MOTION_GRID 16
 /* Cap AE mean subtraction so local motion is not cancelled. */
 #define MOTION_MEAN_CAP 10
-/* After a pan, skip motion/servo for N frames while gray re-seeds (~1 s). */
-#define MOTION_SETTLE_FRAMES 5
+/*
+ * After a pan: pause frame-diff *measurements* for N frames (re-seed gray).
+ * Do not invent velocity coast; servo follows only fresh measurements.
+ */
+#define MOTION_SETTLE_FRAMES 3
+/* Frames with a real blob required before servo may pan. */
+#define MOTION_FRESH_FRAMES 4
+/* EMA on measured bbox center before the Kalman update. */
+#define TRACK_EMA_ALPHA 0.45f
+/* 1D constant-velocity Kalman on horizontal center (pixels, px/s). */
+#define TRACK_KF_Q_POS 2.0f
+#define TRACK_KF_Q_VEL 8.0f
+#define TRACK_KF_R 50.0f
+#define TRACK_VX_DECAY 0.55f
+#define TRACK_VX_MAX 120.0f
+/* Lead horizon only when velocity is trusted (seconds). */
+#define TRACK_LEAD_S 0.20f
+#define TRACK_LEAD_VX_MIN 25.0f
 /* Pan servo on pwmchip0/pwm0 (PD22). Period 20 ms; pulse 1.0–2.0 ms. */
 #define SERVO_PWM_CHIP "/sys/class/pwm/pwmchip0"
 #define SERVO_PWM_PATH "/sys/class/pwm/pwmchip0/pwm0"
@@ -76,9 +95,17 @@
 #define SERVO_DUTY_MIN_NS 1000000L
 #define SERVO_DUTY_MAX_NS 2000000L
 #define SERVO_DUTY_CENTER_NS 1500000L
-#define SERVO_DEADZONE_PX 12
-#define SERVO_GAIN_NS_PER_PX 2500L
-#define SERVO_MAX_STEP_NS 80000L
+#define SERVO_DEADZONE_PX 14
+#define SERVO_MAX_STEP_NS 60000L
+#define SERVO_MAX_STEP_EDGE_NS 140000L
+/* Extra pan gain when target is near the left/right frame edge (0→1). */
+#define SERVO_EDGE_BOOST 2.0f
+/* PID on pixel error → duty_ns/s (integrated each FRAME_MS). */
+#define SERVO_PID_KP 2800.0f
+#define SERVO_PID_KI 180.0f
+#define SERVO_PID_KD 600.0f
+#define SERVO_PID_I_LIM 20000.0f
+#define SERVO_DT_S ((float)FRAME_MS / 1000.0f)
 
 struct shm_buffer {
 	struct wl_buffer *wl_buffer;
@@ -129,8 +156,16 @@ struct cam_state {
 	bool motion_active;
 	int motion_x0, motion_y0, motion_x1, motion_y1;
 	unsigned motion_hold;
-	/* After a pan, skip bbox until the background is stable again. */
+	/* After a pan: skip frame-diff updates; keep last bbox briefly. */
 	unsigned motion_settle;
+	/* Countdown after a real blob; servo pans only while fresh. */
+	unsigned motion_fresh;
+	/* Smoothed track (camera pixel coords). */
+	bool track_have;
+	float track_ema_x, track_ema_y;
+	float track_half_w, track_half_h;
+	float kf_x, kf_vx;
+	float kf_p00, kf_p01, kf_p10, kf_p11;
 };
 
 struct servo_state {
@@ -138,6 +173,9 @@ struct servo_state {
 	bool ready;
 	int pan_sign; /* +1: object on right → increase duty */
 	long duty_ns;
+	float pid_i;
+	float pid_prev_err;
+	bool pid_have_prev;
 };
 
 struct app {
@@ -349,7 +387,19 @@ static void cam_close(struct cam_state *cam)
 	cam->motion_active = false;
 	cam->motion_hold = 0;
 	cam->motion_settle = 0;
+	cam->motion_fresh = 0;
+	cam->track_have = false;
 	cam->have_frame = false;
+}
+
+static void cam_track_reset(struct cam_state *cam)
+{
+	cam->track_have = false;
+	cam->track_ema_x = cam->track_ema_y = 0.f;
+	cam->track_half_w = cam->track_half_h = 0.f;
+	cam->kf_x = cam->kf_vx = 0.f;
+	cam->kf_p00 = cam->kf_p01 = cam->kf_p10 = cam->kf_p11 = 0.f;
+	cam->motion_fresh = 0;
 }
 
 static void cam_motion_reset(struct cam_state *cam)
@@ -358,6 +408,133 @@ static void cam_motion_reset(struct cam_state *cam)
 	cam->motion_active = false;
 	cam->motion_hold = 0;
 	cam->motion_settle = 0;
+	cam->motion_fresh = 0;
+	cam_track_reset(cam);
+}
+
+static void cam_track_apply_bbox(struct cam_state *cam)
+{
+	int w = (int)cam->rgb_w;
+	int h = (int)cam->rgb_h;
+	float cx = cam->kf_x;
+	float cy = cam->track_ema_y;
+	float hw = cam->track_half_w;
+	float hh = cam->track_half_h;
+	int x0, y0, x1, y1;
+
+	if (!cam->track_have || w < 2 || h < 2)
+		return;
+	if (hw < 4.f)
+		hw = 4.f;
+	if (hh < 4.f)
+		hh = 4.f;
+	x0 = (int)lroundf(cx - hw);
+	x1 = (int)lroundf(cx + hw);
+	y0 = (int)lroundf(cy - hh);
+	y1 = (int)lroundf(cy + hh);
+	if (x0 < 0)
+		x0 = 0;
+	if (y0 < 0)
+		y0 = 0;
+	if (x1 >= w)
+		x1 = w - 1;
+	if (y1 >= h)
+		y1 = h - 1;
+	if (x1 < x0)
+		x1 = x0;
+	if (y1 < y0)
+		y1 = y0;
+	cam->motion_x0 = x0;
+	cam->motion_y0 = y0;
+	cam->motion_x1 = x1;
+	cam->motion_y1 = y1;
+}
+
+static void cam_track_predict(struct cam_state *cam, float dt)
+{
+	float q00, q11;
+	float n00, n01, n10, n11;
+
+	if (!cam->track_have || dt <= 0.f)
+		return;
+
+	/* Coast: kill invented velocity so empty-space boxes don't walk away. */
+	cam->kf_vx *= TRACK_VX_DECAY;
+	if (cam->kf_vx > TRACK_VX_MAX)
+		cam->kf_vx = TRACK_VX_MAX;
+	else if (cam->kf_vx < -TRACK_VX_MAX)
+		cam->kf_vx = -TRACK_VX_MAX;
+
+	cam->kf_x += cam->kf_vx * dt;
+	/* F = [[1,dt],[0,1]] ; P = F P F^T + Q */
+	n00 = cam->kf_p00 + dt * (cam->kf_p10 + cam->kf_p01) + dt * dt * cam->kf_p11;
+	n01 = cam->kf_p01 + dt * cam->kf_p11;
+	n10 = cam->kf_p10 + dt * cam->kf_p11;
+	n11 = cam->kf_p11;
+	q00 = TRACK_KF_Q_POS * dt;
+	q11 = TRACK_KF_Q_VEL * dt;
+	cam->kf_p00 = n00 + q00;
+	cam->kf_p01 = n01;
+	cam->kf_p10 = n10;
+	cam->kf_p11 = n11 + q11;
+
+	cam_track_apply_bbox(cam);
+}
+
+static void cam_track_measure(struct cam_state *cam, float zx, float zy,
+			     float half_w, float half_h, float dt)
+{
+	float y, s, k0, k1;
+	float p00, p01, p10, p11;
+
+	if (!cam->track_have) {
+		cam->track_have = true;
+		cam->track_ema_x = zx;
+		cam->track_ema_y = zy;
+		cam->track_half_w = half_w;
+		cam->track_half_h = half_h;
+		cam->kf_x = zx;
+		cam->kf_vx = 0.f;
+		cam->kf_p00 = TRACK_KF_R;
+		cam->kf_p01 = 0.f;
+		cam->kf_p10 = 0.f;
+		cam->kf_p11 = TRACK_KF_Q_VEL;
+		cam_track_apply_bbox(cam);
+		return;
+	}
+
+	cam_track_predict(cam, dt);
+
+	cam->track_ema_x = TRACK_EMA_ALPHA * zx + (1.f - TRACK_EMA_ALPHA) * cam->track_ema_x;
+	cam->track_ema_y = TRACK_EMA_ALPHA * zy + (1.f - TRACK_EMA_ALPHA) * cam->track_ema_y;
+	cam->track_half_w = TRACK_EMA_ALPHA * half_w +
+			    (1.f - TRACK_EMA_ALPHA) * cam->track_half_w;
+	cam->track_half_h = TRACK_EMA_ALPHA * half_h +
+			    (1.f - TRACK_EMA_ALPHA) * cam->track_half_h;
+
+	/* Measurement update on x only (H = [1, 0]). */
+	p00 = cam->kf_p00;
+	p01 = cam->kf_p01;
+	p10 = cam->kf_p10;
+	p11 = cam->kf_p11;
+	y = cam->track_ema_x - cam->kf_x;
+	s = p00 + TRACK_KF_R;
+	if (s < 1e-3f)
+		s = 1e-3f;
+	k0 = p00 / s;
+	k1 = p10 / s;
+	cam->kf_x += k0 * y;
+	cam->kf_vx += k1 * y;
+	if (cam->kf_vx > TRACK_VX_MAX)
+		cam->kf_vx = TRACK_VX_MAX;
+	else if (cam->kf_vx < -TRACK_VX_MAX)
+		cam->kf_vx = -TRACK_VX_MAX;
+	cam->kf_p00 = (1.f - k0) * p00;
+	cam->kf_p01 = (1.f - k0) * p01;
+	cam->kf_p10 = p10 - k1 * p00;
+	cam->kf_p11 = p11 - k1 * p01;
+
+	cam_track_apply_bbox(cam);
 }
 
 static void cam_fill_gray(struct cam_state *cam, unsigned w, unsigned h)
@@ -404,12 +581,19 @@ static bool cam_ensure_gray(struct cam_state *cam, unsigned w, unsigned h)
 
 static void cam_motion_hold_tick(struct cam_state *cam)
 {
+	if (cam->motion_fresh > 0)
+		cam->motion_fresh--;
 	if (cam->motion_hold > 0) {
 		cam->motion_hold--;
-		if (cam->motion_hold == 0)
+		if (cam->motion_hold == 0) {
 			cam->motion_active = false;
+			cam_track_reset(cam);
+		} else if (cam->track_have) {
+			cam_track_predict(cam, SERVO_DT_S);
+		}
 	} else {
 		cam->motion_active = false;
+		cam_track_reset(cam);
 	}
 }
 
@@ -452,12 +636,15 @@ static void cam_motion_update(struct cam_state *cam)
 		return;
 	}
 
-	/* After pan: re-seed gray, do not chase ego-motion as an "object". */
+	/* After pan: re-seed gray; freeze velocity (ego-motion is not a target). */
 	if (cam->motion_settle > 0) {
 		cam_fill_gray(cam, w, h);
 		cam->motion_settle--;
-		cam->motion_active = false;
-		cam->motion_hold = 0;
+		if (cam->track_have) {
+			cam->kf_vx = 0.f;
+			cam_track_apply_bbox(cam);
+		}
+		cam_motion_hold_tick(cam);
 		return;
 	}
 
@@ -519,12 +706,8 @@ static void cam_motion_update(struct cam_state *cam)
 	max_pix = (unsigned)(((unsigned long)w * (unsigned long)h *
 			      (unsigned long)MOTION_MAX_FRAC_PCT) / 100ul);
 	if (count > max_pix) {
-		/*
-		 * Near-global change (servo lag / AE). Do not drop an active
-		 * yellow box — just keep the last bbox until local motion returns.
-		 */
-		if (!cam->motion_active)
-			cam_motion_hold_tick(cam);
+		/* Near-global change: do not refresh a false track forever. */
+		cam_motion_hold_tick(cam);
 		return;
 	}
 	if (count < MOTION_MIN_PIXELS) {
@@ -543,7 +726,7 @@ static void cam_motion_update(struct cam_state *cam)
 			}
 		}
 	}
-	if (seed_hits == 0) {
+	if (seed_hits < MOTION_MIN_SEED_HITS) {
 		cam_motion_hold_tick(cam);
 		return;
 	}
@@ -655,20 +838,29 @@ static void cam_motion_update(struct cam_state *cam)
 	}
 
 	pad = MOTION_PAD_PX;
-	cam->motion_x0 = min_x - pad;
-	cam->motion_y0 = min_y - pad;
-	cam->motion_x1 = max_x + pad;
-	cam->motion_y1 = max_y + pad;
-	if (cam->motion_x0 < 0)
-		cam->motion_x0 = 0;
-	if (cam->motion_y0 < 0)
-		cam->motion_y0 = 0;
-	if (cam->motion_x1 >= (int)w)
-		cam->motion_x1 = (int)w - 1;
-	if (cam->motion_y1 >= (int)h)
-		cam->motion_y1 = (int)h - 1;
+	{
+		int bw = max_x - min_x + 1;
+		int bh = max_y - min_y + 1;
+		unsigned long area = (unsigned long)bw * (unsigned long)bh;
+		unsigned long max_area =
+			((unsigned long)w * (unsigned long)h *
+			 (unsigned long)MOTION_MAX_BBOX_AREA_PCT) / 100ul;
+		float zx, zy, hw, hh;
+
+		if (area > max_area) {
+			cam_motion_hold_tick(cam);
+			return;
+		}
+
+		zx = 0.5f * (float)(min_x + max_x);
+		zy = 0.5f * (float)(min_y + max_y);
+		hw = 0.5f * (float)bw + (float)pad;
+		hh = 0.5f * (float)bh + (float)pad;
+		cam_track_measure(cam, zx, zy, hw, hh, SERVO_DT_S);
+	}
 	cam->motion_active = true;
 	cam->motion_hold = MOTION_HOLD_FRAMES;
+	cam->motion_fresh = MOTION_FRESH_FRAMES;
 }
 
 static int servo_write_str(const char *path, const char *val)
@@ -707,6 +899,9 @@ static bool servo_init(struct servo_state *sv)
 	memset(sv, 0, sizeof(*sv));
 	sv->pan_sign = -1; /* camera-on-servo: object on right → decrease duty */
 	sv->duty_ns = SERVO_DUTY_CENTER_NS;
+	sv->pid_i = 0.f;
+	sv->pid_prev_err = 0.f;
+	sv->pid_have_prev = false;
 	if (env && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' ||
 		    env[0] == 'f' || env[0] == 'F')) {
 		sv->enabled = false;
@@ -747,31 +942,79 @@ static bool servo_init(struct servo_state *sv)
 }
 
 /*
- * Keep yellow-bbox center on the optical axis (horizontal only).
- * Object right of frame center → pan camera right (duty += pan_sign * …).
+ * Pan only on a *fresh* blob measurement. Hold/coast may still draw the
+ * yellow box, but must not drive the servo into empty space or a PWM rail.
  */
 static void servo_follow_motion(struct servo_state *sv, struct cam_state *cam)
 {
-	int cx, err;
+	float cx_cmd, err, derr, u, step_f, lead;
 	long step, duty;
+	float dt = SERVO_DT_S;
 
-	if (!sv->enabled || !sv->ready || !cam->motion_active)
+	if (!sv->enabled || !sv->ready || !cam->motion_active || !cam->track_have)
 		return;
-	if (cam->motion_settle > 0)
+	if (cam->motion_fresh == 0 || cam->motion_settle > 0) {
+		sv->pid_i *= 0.8f;
 		return;
+	}
 	if (cam->rgb_w < 2)
 		return;
 
-	cx = (cam->motion_x0 + cam->motion_x1) / 2;
-	err = cx - (int)cam->rgb_w / 2;
-	if (err > -SERVO_DEADZONE_PX && err < SERVO_DEADZONE_PX)
+	lead = 0.f;
+	if (fabsf(cam->kf_vx) >= TRACK_LEAD_VX_MIN)
+		lead = TRACK_LEAD_S;
+	cx_cmd = cam->kf_x + cam->kf_vx * lead;
+	err = cx_cmd - 0.5f * (float)cam->rgb_w;
+	if (err > -SERVO_DEADZONE_PX && err < SERVO_DEADZONE_PX) {
+		sv->pid_i *= 0.85f;
+		sv->pid_prev_err = err;
+		sv->pid_have_prev = true;
+		return;
+	}
+
+	sv->pid_i += err * dt;
+	if (sv->pid_i > SERVO_PID_I_LIM)
+		sv->pid_i = SERVO_PID_I_LIM;
+	else if (sv->pid_i < -SERVO_PID_I_LIM)
+		sv->pid_i = -SERVO_PID_I_LIM;
+
+	derr = 0.f;
+	if (sv->pid_have_prev && dt > 0.f)
+		derr = (err - sv->pid_prev_err) / dt;
+	sv->pid_prev_err = err;
+	sv->pid_have_prev = true;
+
+	u = SERVO_PID_KP * err + SERVO_PID_KI * sv->pid_i + SERVO_PID_KD * derr;
+	step_f = (float)sv->pan_sign * u * dt;
+	{
+		float half = 0.5f * (float)cam->rgb_w;
+		float edge = half > 1.f ? fabsf(err) / half : 0.f;
+		float scale;
+		long max_step;
+
+		if (edge > 1.f)
+			edge = 1.f;
+		/* Quadratic: mild near center, much larger step near the edge. */
+		scale = 1.f + SERVO_EDGE_BOOST * edge * edge;
+		step_f *= scale;
+		max_step = SERVO_MAX_STEP_NS +
+			   (long)lroundf((float)(SERVO_MAX_STEP_EDGE_NS - SERVO_MAX_STEP_NS) *
+					edge);
+		step = (long)lroundf(step_f);
+		if (step > max_step)
+			step = max_step;
+		else if (step < -max_step)
+			step = -max_step;
+	}
+	if (step == 0)
 		return;
 
-	step = sv->pan_sign * (long)err * SERVO_GAIN_NS_PER_PX;
-	if (step > SERVO_MAX_STEP_NS)
-		step = SERVO_MAX_STEP_NS;
-	else if (step < -SERVO_MAX_STEP_NS)
-		step = -SERVO_MAX_STEP_NS;
+	/* Anti-windup at PWM rails — was stuck at 2.0 ms in the HDMI capture. */
+	if ((sv->duty_ns >= SERVO_DUTY_MAX_NS && step > 0) ||
+	    (sv->duty_ns <= SERVO_DUTY_MIN_NS && step < 0)) {
+		sv->pid_i = 0.f;
+		return;
+	}
 
 	duty = sv->duty_ns + step;
 	if (duty < SERVO_DUTY_MIN_NS)
@@ -782,10 +1025,8 @@ static void servo_follow_motion(struct servo_state *sv, struct cam_state *cam)
 		return;
 	if (servo_write_ll(SERVO_PWM_PATH "/duty_cycle", duty) == 0) {
 		sv->duty_ns = duty;
-		/* Re-seed motion after ego-pan so the whole frame is not a "blob". */
-		cam->motion_settle = MOTION_SETTLE_FRAMES;
-		cam->motion_active = false;
-		cam->motion_hold = 0;
+		if (cam->motion_settle == 0)
+			cam->motion_settle = MOTION_SETTLE_FRAMES;
 	}
 }
 
@@ -1314,7 +1555,7 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_set_source_rgb(cr, 0.85, 0.90, 0.95);
 	snprintf(line, sizeof(line), "Camera  ·  %s%s%s", app->cam.status,
 		 app->cam.motion_active ? "  ·  motion" : "",
-		 (app->servo.ready && app->cam.motion_active) ? "  ·  track" : "");
+		 (app->servo.ready && app->cam.motion_fresh > 0) ? "  ·  track" : "");
 	cairo_move_to(cr, 14, 24);
 	cairo_show_text(cr, line);
 
