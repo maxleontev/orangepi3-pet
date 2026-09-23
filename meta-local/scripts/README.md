@@ -33,6 +33,29 @@ FORCE=1 meta-local/scripts/gen-root-ssh-key.sh
 | `KEY_COMMENT` | `root@orange-pi-3` | Comment on the public key |
 | `FORCE` | `0` | `1` replaces files that already exist |
 
+<a id="gen-khepri-passwd"></a>
+## `gen-khepri-passwd.sh`
+
+Writes the console password and its SHA-256 crypt hash to a gitignored file:
+
+`meta-local/recipes-core/images/khepri-user-passwd.inc`
+
+`core-image-khepri` requires that file and sets `KHEPRI_USER_PASSWD` from the
+hash for both `root` and user `max`. Run this once after a fresh clone,
+before `bitbake`. Replacing an existing file needs `FORCE=1`. The board keeps
+the previous password until the image is rebuilt and flashed.
+
+```bash
+PASSWORD='…' meta-local/scripts/gen-khepri-passwd.sh
+FORCE=1 PASSWORD='…' meta-local/scripts/gen-khepri-passwd.sh
+```
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `PASSWORD` | | Console password (required) |
+| `PASSWD_FILE` | `meta-local/recipes-core/images/khepri-user-passwd.inc` | Output file |
+| `FORCE` | `0` | `1` replaces a file that already exists |
+
 <a id="make-ab-update-bundle"></a>
 ## `make-ab-update-bundle.sh`
 

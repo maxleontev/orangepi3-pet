@@ -4,3 +4,6 @@ __pycache__/
 
 # Local root SSH key (meta-local/scripts/README.md#gen-root-ssh-key)
 meta-local/recipes-core/root-ssh-keys/files/
+
+# Console password and its crypt hash (meta-local/scripts/README.md#gen-khepri-passwd)
+meta-local/recipes-core/images/khepri-user-passwd.inc

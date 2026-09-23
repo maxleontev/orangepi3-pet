@@ -30,6 +30,7 @@ Auto-review / smart-mode approval cards for these when avoidable:
 
 - SSH to `root@192.168.3.71` (prefer `SSH_BIND=192.168.3.6`) for
   diagnostics (`dmesg`, `lsusb`, `uptime`, services, logs, …)
+- Serial console on `/dev/ttyUSB0` when SSH to the board fails (see below)
 - [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot)
   / host Logitech HDMI camera stills under `build-orangepi3/tmp/`
 - [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update) after
@@ -42,6 +43,24 @@ calls with `required_permissions: ["all"]`) and continue without chatting
 about confirmation. Do **not** ask the user to click Approve; only use
 `request_smart_mode_approval` as a last resort when no alternative path
 exists, and then without a chat prompt.
+
+## Serial console when SSH is down
+
+If `root@192.168.3.71` does not answer, use the wired console instead of
+stopping. Open `/dev/ttyUSB0` at 115200 8N1, raw, no echo. The device is
+`root:dialout` and mode `crw-rw----`; user `max` is not in `dialout`, so
+open it with `sudo -n`. Log in as `root`.
+
+The console password is `KHEPRI_CONSOLE_PASSWORD` in
+[`khepri-user-passwd.inc`](meta-local/recipes-core/images/khepri-user-passwd.inc).
+That file is gitignored. Create it with
+[`gen-khepri-passwd.sh`](meta-local/scripts/README.md#gen-khepri-passwd)
+if it is missing. Read the password from the file at login time. Do not
+copy it into chat, commits, rules, or any other tracked file.
+
+Send short commands one at a time. A long line wraps on the serial link
+and the shell runs the fragments. If the prompt is `login:` or
+`Password:`, finish login before sending a diagnostic command.
 
 When debugging the live board (HDMI panel, audio, WiFi, reboots,
 Weston):

@@ -36,11 +36,12 @@ inherit core-image extrausers
 
 # Root may SSH in with a key (allow-root-login); empty-password logins disabled.
 # Dropbear -g (below) blocks root password auth over SSH. Console password for
-# root matches user max (same crypt salt/hash).
+# root matches user max (same crypt hash). The hash lives in a gitignored file
+# written by meta-local/scripts/gen-khepri-passwd.sh.
 IMAGE_FEATURES:remove = "empty-root-password allow-empty-password"
 IMAGE_FEATURES += "allow-root-login"
 
-KHEPRI_USER_PASSWD = ""
+require recipes-core/images/khepri-user-passwd.inc
 
 EXTRA_USERS_PARAMS = " \
     usermod -p '${KHEPRI_USER_PASSWD}' root; \
