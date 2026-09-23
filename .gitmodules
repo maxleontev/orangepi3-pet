@@ -9,4 +9,4 @@
 	url = https://git.openembedded.org/meta-openembedded.git
 [submodule "meta-arm"]
 	path = meta-arm
-	url = git://git.yoctoproject.org/meta-arm.git
+	url = https://git.yoctoproject.org/meta-arm.git
