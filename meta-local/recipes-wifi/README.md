@@ -6,7 +6,7 @@ UI when STA cannot join a router.
 
 | Recipe | Role |
 |--------|------|
-| `wifi-init/` | `wifi.service` / `wifi-roam.service`, scripts, setup web UI, lighttpd config |
+| `wifi-init/` | `wifi.service` / `wifi-roam.service` / `wifi-watch.service`, scripts, setup web UI, lighttpd config |
 | `fw-ap6256/` | Board-specific brcmfmac NVRAM (`brcmfmac43456-sdio.txt`) |
 
 Related pieces outside this folder:
@@ -27,6 +27,13 @@ Related pieces outside this folder:
 2. Reads `/data/wifi.conf` (wpa_supplicant format)
 3. Associates, runs DHCP (`udhcpc`), writes `/run/wifi-mode=sta`
 4. `wifi-roam` may switch among configured SSIDs by measured RSSI
+5. `wifi-watch` flushes the address and reassociates when `wpa_state` is
+   not `COMPLETED`, or when the IPv4 default gateway on `wlan0` does not
+   answer. That address is written to `GATEWAY` from the route (`default
+   via …` installed by DHCP), not a fixed host. It calls `enable_network
+   all`, never `select_network`. Setup AP mode is left alone. Each
+   recovery increments `/run/wifi-watch-count` (starts at `0` when the
+   service starts).
 
 ### Setup AP (fallback)
 

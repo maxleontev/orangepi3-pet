@@ -1,0 +1,21 @@
+# Recover STA after a drop (see /usr/sbin/wifi-watch).
+#
+# wifi-roam does not run unless wpa_state=COMPLETED. This unit flushes
+# the address and reassociates when the state is anything else, or when
+# the gateway does not answer. It does not call select_network.
+
+[Unit]
+Description=WiFi association and gateway watchdog
+Documentation=file:///data/wifi.conf
+After=wifi.service
+Requires=wifi.service
+PartOf=wifi.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wifi-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
