@@ -12,8 +12,8 @@ Related config outside this folder (required for a working image):
 | Machine: `use-mailine-graphics`, OpenGL | `meta-local/conf/machine/orange-pi-3.conf` |
 | Kernel DRM/Lima/THS fragments | `meta-local/recipes-kernel/linux/files/drm.cfg` |
 | AC200 analog microphone | `meta-local/recipes-multimedia/ac200-audio/` (mixer + kernel inc) |
-| Image packages | `core-image-khepri.bb` → `weston weston-init` + panel (`info-panel` or `info-panel-camera`) + `kmscube display-rf-blacklist ac200-audio` |
-| Panel switch | `INFO_PANEL` in `local.conf` (`stats` default, or `camera`) via `orangepi3-graphics.inc` |
+| Image packages | `core-image-khepri.bb` → `weston weston-init` + panel (`info-panel`, `info-panel-camera`, or `info-panel-track`) + `kmscube display-rf-blacklist ac200-audio` |
+| Panel switch | `INFO_PANEL` in `local.conf` (`stats` default, `camera`, or `track`) via `orangepi3-graphics.inc` |
 
 ---
 
@@ -25,9 +25,10 @@ Which fullscreen client is installed is selected at **image build** time:
 # build-orangepi3/conf/local.conf
 INFO_PANEL = "stats"    # default — system stats + mic spectrum
 INFO_PANEL = "camera"   # live USB UVC preview (Logitech etc.)
+INFO_PANEL = "track"    # UVC preview + redesigned servo follow
 ```
 
-Only one of `info-panel` / `info-panel-camera` is in the rootfs.
+Only one of `info-panel` / `info-panel-camera` / `info-panel-track` is in the rootfs.
 
 ### `INFO_PANEL = "stats"` (default)
 
@@ -65,6 +66,17 @@ Fullscreen **info-panel-camera**: live preview from a USB UVC webcam (e.g. Logit
 - Size hint: `INFO_PANEL_CAMERA_SIZE=WxH` (else tries 1280×720 … 640×480)
 - Redraw capped ~5 fps (`FRAME_MS=200`); same wl_shm busy-buffer rules as the stats panel
 - Kernel: `uvc.cfg` enables `CONFIG_MEDIA_USB_SUPPORT` + `CONFIG_USB_VIDEO_CLASS=m`
+
+### `INFO_PANEL = "track"`
+
+Fullscreen **info-panel-track**: UVC preview plus redesigned pan-servo follow
+(separate binary from `info-panel-camera`; old motion→PID path stays as-is).
+
+- Same V4L2 / letterbox / SIGUSR1 screenshot contract as the camera panel
+- Status bar shows track FSM state (`idle` / `acquire` / `lock` / …) and `servo`
+- Servo: HW PWM0 on PD22; `INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1`
+- Detector/association not wired yet — FSM stays `idle`, box/servo idle until filled in
+- Capture target ~10 fps (`FRAME_MS=100`); UI still respects busy wl_shm buffers
 
 ---
 
@@ -126,8 +138,9 @@ around that constraint.
    ExecStart: weston --drm-device=…
 
 5. Panel service (After/BindsTo/PartOf=weston.service)
-   waits for /run/wayland-0, then runs either
-   `/usr/bin/info-panel` or `/usr/bin/info-panel-camera` (see INFO_PANEL).
+   waits for /run/wayland-0, then runs
+   `/usr/bin/info-panel`, `/usr/bin/info-panel-camera`, or
+   `/usr/bin/info-panel-track` (see INFO_PANEL).
 ```
 
 Default target stays **`multi-user.target`** (not `graphical.target`) so SSH and
@@ -204,6 +217,16 @@ Meson + Wayland client (`info-panel-camera.c`) + `info-panel-camera.service`.
 - Installs shared `/usr/sbin/hdmi-screenshot` (same script as stats; signals
   whichever panel is running).
 
+### `info-panel-track/`
+
+Meson + Wayland client (`info-panel-track.c`) + `info-panel-track.service`.
+
+- Installed when `INFO_PANEL = "track"` in `local.conf`.
+- UVC preview + pan-servo control scaffold (FSM: idle/acquire/lock/coast/ego/lost).
+- Does **not** reuse the camera panel’s frame-diff→PID path; detector filled in later.
+- Same UVC udev/modprobe snippets and PWM0 export as the camera service.
+- Installs shared `/usr/sbin/hdmi-screenshot`.
+
 ### Image extra: `kmscube`
 
 Installed for manual DRM/GL smoke tests (`kmscube`) with Weston stopped if needed.
@@ -252,12 +275,13 @@ MACHINE_FEATURES:append = " opengl"
 | `weston.socket` | yes | Triggered with weston |
 | `info-panel.service` | when stats | Tied to weston lifecycle |
 | `info-panel-camera.service` | when camera | Tied to weston lifecycle |
+| `info-panel-track.service` | when track | Tied to weston lifecycle |
 
 Useful commands on the board:
 
 ```sh
-systemctl status wifi weston info-panel info-panel-camera --no-pager -l
-journalctl -u weston -u info-panel -u info-panel-camera -b --no-pager -l
+systemctl status wifi weston info-panel info-panel-camera info-panel-track --no-pager -l
+journalctl -u weston -u info-panel -u info-panel-camera -u info-panel-track -b --no-pager -l
 cat /run/weston-drm-device
 ls -l /dev/dri /sys/class/drm/card*-HDMI-A-*/status /dev/video*
 cat /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp
@@ -268,7 +292,7 @@ iw dev wlan0 link
 Stop graphics (e.g. to debug WiFi RF):
 
 ```sh
-systemctl stop info-panel info-panel-camera weston
+systemctl stop info-panel info-panel-camera info-panel-track weston
 # optional: unload display modules
 modprobe -r sun8i_drm_hdmi lima sun4i_drm 2>/dev/null || true
 ```
@@ -280,6 +304,7 @@ systemctl start weston
 # then whichever panel the image shipped:
 systemctl start info-panel          # INFO_PANEL=stats
 systemctl start info-panel-camera   # INFO_PANEL=camera
+systemctl start info-panel-track    # INFO_PANEL=track
 ```
 
 ---
@@ -322,7 +347,7 @@ recipes-graphics/
 │       ├── weston-prepare-drm.sh
 │       └── weston-pick-drm.sh
 ├── files/
-│   └── hdmi-screenshot.sh             → /usr/sbin/hdmi-screenshot (both panels)
+│   └── hdmi-screenshot.sh             → /usr/sbin/hdmi-screenshot (all panels)
 ├── info-panel/
 │   ├── info-panel.bb
 │   └── files/
@@ -330,12 +355,19 @@ recipes-graphics/
 │       └── info-panel/
 │           ├── info-panel.c
 │           └── meson.build
-└── info-panel-camera/
-    ├── info-panel-camera.bb
+├── info-panel-camera/
+│   ├── info-panel-camera.bb
+│   └── files/
+│       ├── info-panel-camera.service
+│       └── info-panel-camera/
+│           ├── info-panel-camera.c
+│           └── meson.build
+└── info-panel-track/
+    ├── info-panel-track.bb
     └── files/
-        ├── info-panel-camera.service
-        └── info-panel-camera/
-            ├── info-panel-camera.c
+        ├── info-panel-track.service
+        └── info-panel-track/
+            ├── info-panel-track.c
             └── meson.build
 ```
 

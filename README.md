@@ -129,13 +129,14 @@ Must run as root. After success: power off, remove the SD card, power on
 ### On target: `hdmi-screenshot` (`/usr/sbin/hdmi-screenshot`)
 
 Dumps the live HDMI panel frame (last committed Wayland SHM buffer) to PNG.
-Installed by whichever panel recipe is in the image (`info-panel` or
-`info-panel-camera`). That panel process must be running.
-`info-panel-camera` also draws a yellow motion bbox (densest changed
-blob; ignores weak/global noise) and, when a hobby servo is on CON12
-pin 7 (HW PWM0 / PD22), PID-pans only on fresh blob measurements
-(`INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1` flips pan
-direction from the camera-on-servo default).
+Installed by whichever panel recipe is in the image (`info-panel`,
+`info-panel-camera`, or `info-panel-track`). That panel process must be running.
+
+`info-panel-camera` draws a yellow motion bbox (legacy frame-diff) and may
+PID-pan a hobby servo on CON12 pin 7 (HW PWM0 / PD22).
+`info-panel-track` is the redesigned follow panel (FSM + servo scaffold;
+detector not wired yet). `INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1`
+flips pan direction from the camera-on-servo default.
 
 ```bash
 hdmi-screenshot                  # TTY: /tmp/hdmi-screenshot.png (prints path)

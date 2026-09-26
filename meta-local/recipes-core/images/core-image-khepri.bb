@@ -12,13 +12,21 @@ IMAGE_FEATURES += "splash read-only-rootfs"
 IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init hostapd dnsmasq mc sd-to-emmc root-ssh-keys ab-update"
 IMAGE_INSTALL:append = " weston weston-init kmscube display-rf-blacklist"
 IMAGE_INSTALL:append = " ac200-audio"
-# INFO_PANEL from orangepi3-graphics.inc / local.conf: "stats" or "camera".
-IMAGE_INSTALL:append = "${@bb.utils.contains('INFO_PANEL', 'camera', ' info-panel-camera', ' info-panel', d)}"
+# INFO_PANEL from orangepi3-graphics.inc / local.conf: stats|camera|track.
+def khepri_info_panel_pkg(d):
+    v = (d.getVar('INFO_PANEL') or 'stats').strip()
+    return {
+        'stats': ' info-panel',
+        'camera': ' info-panel-camera',
+        'track': ' info-panel-track',
+    }.get(v, ' info-panel')
+
+IMAGE_INSTALL:append = "${@khepri_info_panel_pkg(d)}"
 
 python() {
     v = (d.getVar('INFO_PANEL') or 'stats').strip()
-    if v not in ('stats', 'camera'):
-        bb.fatal('INFO_PANEL must be "stats" or "camera", got %r' % v)
+    if v not in ('stats', 'camera', 'track'):
+        bb.fatal('INFO_PANEL must be "stats", "camera", or "track", got %r' % v)
 }
 
 
