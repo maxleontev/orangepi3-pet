@@ -4,11 +4,9 @@ LICENSE = "CLOSED"
 SRC_URI = " \
     file://wifi.service \
     file://wifi-roam.service \
-    file://wifi-watch.service \
     file://wifi-usb.service \
     file://wifi-connect.sh \
     file://wifi-roam.sh \
-    file://wifi-watch.sh \
     file://wifi-usb-connect.sh \
     file://wifi-ap-start.sh \
     file://wifi-ap-stop.sh \
@@ -16,7 +14,6 @@ SRC_URI = " \
     file://wifi-scan.sh \
     file://wifi-test-connect.sh \
     file://wifi-conf-lib.sh \
-    file://brcmfmac.conf \
     file://lighttpd.conf \
     file://www/index.html \
     file://www/cgi-bin/form-parse.sh \
@@ -32,22 +29,17 @@ do_install() {
     install -d ${D}${systemd_system_unitdir}
     install -m 0644 ${WORKDIR}/wifi.service ${D}${systemd_system_unitdir}/
     install -m 0644 ${WORKDIR}/wifi-roam.service ${D}${systemd_system_unitdir}/
-    install -m 0644 ${WORKDIR}/wifi-watch.service ${D}${systemd_system_unitdir}/
     install -m 0644 ${WORKDIR}/wifi-usb.service ${D}${systemd_system_unitdir}/
 
     install -d ${D}${sbindir}
     install -m 0755 ${WORKDIR}/wifi-connect.sh ${D}${sbindir}/wifi-connect
     install -m 0755 ${WORKDIR}/wifi-roam.sh ${D}${sbindir}/wifi-roam
-    install -m 0755 ${WORKDIR}/wifi-watch.sh ${D}${sbindir}/wifi-watch
     install -m 0755 ${WORKDIR}/wifi-usb-connect.sh ${D}${sbindir}/wifi-usb-connect
     install -m 0755 ${WORKDIR}/wifi-ap-start.sh ${D}${sbindir}/wifi-ap-start
     install -m 0755 ${WORKDIR}/wifi-ap-stop.sh ${D}${sbindir}/wifi-ap-stop
     install -m 0755 ${WORKDIR}/wifi-write-config.sh ${D}${sbindir}/wifi-write-config
     install -m 0755 ${WORKDIR}/wifi-scan.sh ${D}${sbindir}/wifi-scan
     install -m 0755 ${WORKDIR}/wifi-test-connect.sh ${D}${sbindir}/wifi-test-connect
-
-    install -d ${D}${sysconfdir}/modprobe.d
-    install -m 0644 ${WORKDIR}/brcmfmac.conf ${D}${sysconfdir}/modprobe.d/brcmfmac.conf
 
     install -d ${D}${datadir}/wifi-setup
     install -m 0644 ${WORKDIR}/wifi-conf-lib.sh ${D}${datadir}/wifi-setup/
@@ -62,9 +54,9 @@ do_install() {
     install -m 0755 ${WORKDIR}/www/cgi-bin/test-status ${D}${datadir}/wifi-setup/www/cgi-bin/
 }
 
-SYSTEMD_SERVICE:${PN} = "wifi.service wifi-roam.service wifi-watch.service wifi-usb.service"
+SYSTEMD_SERVICE:${PN} = "wifi.service wifi-roam.service wifi-usb.service"
 SYSTEMD_AUTO_ENABLE = "enable"
 
 RDEPENDS:${PN} += "wpa-supplicant iw hostapd dnsmasq lighttpd lighttpd-module-cgi"
 
-FILES:${PN} += "${datadir}/wifi-setup ${sysconfdir}/modprobe.d/brcmfmac.conf"
+FILES:${PN} += "${datadir}/wifi-setup"
