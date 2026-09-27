@@ -7,18 +7,26 @@ alwaysApply: true
 
 ## Default for live board work
 
-For diagnostics and control of the live Orange Pi 3 (**status, dmesg,
-`ip`, services, WiFi/Ethernet, HDMI off, reboot**):
+**Default** flash and board control use **onboard Ethernet SSH**:
+`TARGET=root@192.168.3.73` + `SSH_BIND=192.168.3.6`. Do not blank HDMI for
+eth flashes.
 
-- **Start with serial** (`/dev/ttyUSB0`, 115200). Do **not** try SSH first.
-- Do not “probe SSH then fall back” — that wastes time and ignores this rule.
-- SSH is allowed only when serial cannot do the job: large file copy
-  (`push-ab-update`, `scp` of binaries), or
-  [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot)
-  over the network; prefer `TARGET=root@192.168.3.73` (board eth) and
-  `SSH_BIND=192.168.3.6` (host eth) then.
-- If the user says «терминал» / «serial», use serial exclusively for that
-  turn’s board commands (except the file-copy cases above).
+Use **serial** (`/dev/ttyUSB0`, 115200) when:
+
+- Eth is down / unreachable, or
+- You must blank HDMI before a **WiFi-only** SSH flash (eth unavailable), or
+- The user says «терминал» / «serial» (then serial exclusively for that
+  turn’s board commands, except bulk file copy / SHM pull over the net).
+
+For WiFi flash HDMI blank (only if eth is down): stop `weston` /
+`weston.socket` (+ info-panel), then unload DRM so the cable is really off
+— not a black Weston frame. Recipe:
+[`recipes-graphics` README — Systemd units](meta-local/recipes-graphics/README.md#systemd-units-runtime).
+Then run [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update)
+over WiFi. Details: `project-standards` A/B Updates.
+
+Bulk transfer / SHM pull still use SSH (eth preferred; WiFi only if eth is
+down).
 
 ## Auth and Approve
 

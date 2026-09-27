@@ -28,19 +28,18 @@ Routine board work is **pre-approved**. Never ask the user to confirm,
 never pause for “ok to SSH / screenshot / flash / serial?”, and never
 surface Auto-review / smart-mode approval cards for these:
 
-- **Serial console first** on `/dev/ttyUSB0` for live-board diagnostics
-  and control (see `.cursor/rules/serial-no-approve.mdc`) — including
-  reading `KHEPRI_CONSOLE_PASSWORD` from the gitignored
-  `khepri-user-passwd.inc` and `sudo -n` open of `/dev/ttyUSB0`
-- SSH only when needed for bulk transfer or HDMI SHM pull. Prefer onboard
-  Ethernet: `TARGET=root@192.168.3.73` with `SSH_BIND=192.168.3.6`.
-  WiFi fallbacks (`.71` / `.72` / `.4`) only if cable eth is down
+- **Onboard Ethernet SSH (default)** for board control and flash:
+  `TARGET=root@192.168.3.73` + `SSH_BIND=192.168.3.6`
+- **Serial** on `/dev/ttyUSB0` when eth is down, or to blank HDMI before a
+  WiFi flash (see `.cursor/rules/serial-no-approve.mdc`) — including reading
+  `KHEPRI_CONSOLE_PASSWORD` from the gitignored `khepri-user-passwd.inc`
+  and `sudo -n` open of `/dev/ttyUSB0`
+- WiFi SSH (`.71` / `.72` / `.4`, `SSH_BIND=192.168.3.37`) only if eth is
+  down; for flash see `project-standards` (HDMI blank over serial first)
 - [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot)
   / host Logitech HDMI camera stills under `build-orangepi3/tmp/`
-- Full HDMI off before flash, then
-  [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update) after
-  image rebuilds (see `project-standards` A/B Updates: stop Weston/socket,
-  then unload DRM so the cable is really blank — not a black Weston frame)
+- [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update) after
+  image rebuilds (eth default; no HDMI off on eth — see `project-standards`)
 - `bitbake` in `build-orangepi3/`
 
 **Never** use `request_smart_mode_approval` for the items above. Run them
@@ -55,8 +54,10 @@ exception). See `.cursor/rules/serial-no-approve.mdc`.
 
 ## Serial console
 
-Default for live-board diagnostics: serial on `/dev/ttyUSB0` (see
-`.cursor/rules/serial-no-approve.mdc`). Do not try SSH first.
+Default board control is **eth SSH** (`.73`). Use serial on `/dev/ttyUSB0`
+when eth is unavailable, when the user asks for «терминал» / «serial», or
+to blank HDMI before a WiFi-only flash (see
+`.cursor/rules/serial-no-approve.mdc`).
 
 Open `/dev/ttyUSB0` at 115200 8N1, raw, no echo. The device is
 `root:dialout` and mode `crw-rw----`; user `max` is not in `dialout`, so
