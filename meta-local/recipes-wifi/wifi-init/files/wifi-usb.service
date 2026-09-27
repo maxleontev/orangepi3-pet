@@ -1,0 +1,19 @@
+# Secondary USB WiFi STA (TL-WN722N / ath9k_htc, …).
+# Uses the same /data/wifi.conf as wlan0. Idles when no stick; recovers on
+# replug and after radio / address drops.
+
+[Unit]
+Description=USB WiFi STA (secondary adapter)
+Documentation=file:///data/wifi.conf
+After=wifi.service systemd-modules-load.service
+Wants=wifi.service
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wifi-usb-connect
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

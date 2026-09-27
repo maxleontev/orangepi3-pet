@@ -120,10 +120,12 @@ start_setup_ap() {
 }
 
 cleanup_stale() {
-	# Problem: re-ExecStart / manual wifi-connect with a live wpa_supplicant or
-	# leftover ctrl socket → start failure or a silently stuck client. Kill
-	# daemons first, then remove sockets.
-	killall wpa_supplicant udhcpc 2>/dev/null || true
+	# Only tear down *this* iface — a USB STA may own another wpa_supplicant.
+	if [ -f "/run/wpa_supplicant-${IFACE}.pid" ]; then
+		kill "$(cat "/run/wpa_supplicant-${IFACE}.pid")" 2>/dev/null || true
+		rm -f "/run/wpa_supplicant-${IFACE}.pid"
+	fi
+	wpa_cli -i "$IFACE" terminate 2>/dev/null || true
 	rm -f "/var/run/wpa_supplicant/$IFACE" "/run/wpa_supplicant/$IFACE" 2>/dev/null || true
 	sleep 1
 }
@@ -222,7 +224,10 @@ while [ "$i" -lt 10 ]; do
 done
 
 if ! wait_associated; then
-	killall wpa_supplicant 2>/dev/null || true
+	if [ -f "/run/wpa_supplicant-${IFACE}.pid" ]; then
+		kill "$(cat "/run/wpa_supplicant-${IFACE}.pid")" 2>/dev/null || true
+	fi
+	wpa_cli -i "$IFACE" terminate 2>/dev/null || true
 	if [ "$AP_FALLBACK" = "1" ]; then
 		start_setup_ap
 	fi
@@ -231,7 +236,10 @@ fi
 
 ip -4 addr flush dev "$IFACE" 2>/dev/null || true
 if ! udhcpc -i "$IFACE" -n -q -t 10 -T 3; then
-	killall wpa_supplicant udhcpc 2>/dev/null || true
+	if [ -f "/run/wpa_supplicant-${IFACE}.pid" ]; then
+		kill "$(cat "/run/wpa_supplicant-${IFACE}.pid")" 2>/dev/null || true
+	fi
+	wpa_cli -i "$IFACE" terminate 2>/dev/null || true
 	if [ "$AP_FALLBACK" = "1" ]; then
 		start_setup_ap
 	fi
