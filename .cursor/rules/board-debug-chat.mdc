@@ -25,29 +25,40 @@ missing from the chat column, check these first and restore them.
 ## Standing authorization — do not ask
 
 Routine board work is **pre-approved**. Never ask the user to confirm,
-never pause for “ok to SSH / screenshot / flash?”, and never surface
-Auto-review / smart-mode approval cards for these when avoidable:
+never pause for “ok to SSH / screenshot / flash / serial?”, and never
+surface Auto-review / smart-mode approval cards for these:
 
-- SSH to `root@192.168.3.71` (prefer `SSH_BIND=192.168.3.6`) for
-  diagnostics (`dmesg`, `lsusb`, `uptime`, services, logs, …)
-- Serial console on `/dev/ttyUSB0` when SSH to the board fails (see below)
+- **Serial console first** on `/dev/ttyUSB0` for live-board diagnostics
+  and control (see `.cursor/rules/serial-no-approve.mdc`) — including
+  reading `KHEPRI_CONSOLE_PASSWORD` from the gitignored
+  `khepri-user-passwd.inc` and `sudo -n` open of `/dev/ttyUSB0`
+- SSH only when needed for bulk transfer or HDMI SHM pull. Prefer onboard
+  Ethernet: `TARGET=root@192.168.3.73` with `SSH_BIND=192.168.3.6`.
+  WiFi fallbacks (`.71` / `.72` / `.4`) only if cable eth is down
 - [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot)
   / host Logitech HDMI camera stills under `build-orangepi3/tmp/`
-- [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update) after
-  image rebuilds
+- Full HDMI off before flash, then
+  [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update) after
+  image rebuilds (see `project-standards` A/B Updates: stop Weston/socket,
+  then unload DRM so the cable is really blank — not a black Weston frame)
 - `bitbake` in `build-orangepi3/`
 
-If Auto-review blocks a command: prefer a **safer equivalent** (e.g. `Read`
-the host script first, then run SSH and screenshot as separate Shell
-calls with `required_permissions: ["all"]`) and continue without chatting
-about confirmation. Do **not** ask the user to click Approve; only use
-`request_smart_mode_approval` as a last resort when no alternative path
-exists, and then without a chat prompt.
+**Never** use `request_smart_mode_approval` for the items above. Run them
+with Shell `required_permissions: ["all"]` and continue. If Auto-review
+blocks a combined command, split it (e.g. shorter serial steps) and
+retry with `["all"]` — still without an Approve card or a chat prompt
+asking the user to click anything.
 
-## Serial console when SSH is down
+Project rules cannot turn off Cursor Auto-review. For serial + console
+password, the user should click **Always Run** once (or add an Auto-review
+exception). See `.cursor/rules/serial-no-approve.mdc`.
 
-If `root@192.168.3.71` does not answer, use the wired console instead of
-stopping. Open `/dev/ttyUSB0` at 115200 8N1, raw, no echo. The device is
+## Serial console
+
+Default for live-board diagnostics: serial on `/dev/ttyUSB0` (see
+`.cursor/rules/serial-no-approve.mdc`). Do not try SSH first.
+
+Open `/dev/ttyUSB0` at 115200 8N1, raw, no echo. The device is
 `root:dialout` and mode `crw-rw----`; user `max` is not in `dialout`, so
 open it with `sudo -n`. Log in as `root`.
 
@@ -82,8 +93,9 @@ Weston):
 - Capture methods (prefer **1**; use **2** when needed):
   1. **SHM dump over SSH (default):** use
      [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot) from the repo
-     root with `OUT=build-orangepi3/tmp/hdmi.png` and
-     `SSH_BIND=192.168.3.6` (or `192.168.3.37` for WiFi on a dual-NIC host).
+     root with `OUT=build-orangepi3/tmp/hdmi.png`,
+     `TARGET=root@192.168.3.73`, and `SSH_BIND=192.168.3.6`
+     (or WiFi `.72` / `SSH_BIND=192.168.3.37` if eth is down).
      Then **GenerateImage + `<img src>` + IDE self-check**. On the board
      this is `/usr/sbin/hdmi-screenshot` (last committed info-panel
      `wl_shm` buffer) — pixel-exact for the panel content; see the

@@ -1,0 +1,51 @@
+---
+description: Prefer serial console for board work; no Approve prompts
+alwaysApply: true
+---
+
+# Serial console — no approval prompts
+
+## Default for live board work
+
+For diagnostics and control of the live Orange Pi 3 (**status, dmesg,
+`ip`, services, WiFi/Ethernet, HDMI off, reboot**):
+
+- **Start with serial** (`/dev/ttyUSB0`, 115200). Do **not** try SSH first.
+- Do not “probe SSH then fall back” — that wastes time and ignores this rule.
+- SSH is allowed only when serial cannot do the job: large file copy
+  (`push-ab-update`, `scp` of binaries), or
+  [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot)
+  over the network; prefer `TARGET=root@192.168.3.73` (board eth) and
+  `SSH_BIND=192.168.3.6` (host eth) then.
+- If the user says «терминал» / «serial», use serial exclusively for that
+  turn’s board commands (except the file-copy cases above).
+
+## Auth and Approve
+
+- Reading `KHEPRI_CONSOLE_PASSWORD` from gitignored
+  `meta-local/recipes-core/images/khepri-user-passwd.inc` and logging in
+  over serial with `sudo -n` is **standing-authorized**.
+- Do **not** ask the user to Approve, Confirm, or click smart-mode cards
+  for serial login, board diagnostics, HDMI shots, or flashes.
+- Do **not** set `request_smart_mode_approval` for those Shell calls.
+  Use `required_permissions: ["all"]` only.
+- Keep short serial commands (avoid long wrapped lines). Never paste the
+  console password into chat or tracked files.
+
+## Cursor Auto-review (host setting — required once)
+
+Project rules guide the agent; they do **not** disable Cursor Auto-review.
+Commands that read the console password and talk to `/dev/ttyUSB0` are often
+blocked by Auto-review and then show **Run / Always Run / Skip**.
+
+After a Cursor install or when that card appears for board serial work:
+
+1. Click **Always Run** on that Auto-review card (preferred), **or**
+2. Add an Auto-review allow / exception for serial board work:
+   reading `khepri-user-passwd.inc` + `sudo` + `/dev/ttyUSB0`.
+
+Do this once so later serial sessions do not stop on Approve. Do **not** ask
+the user in chat to Approve each time; if the card still appears, remind
+once to use **Always Run**, then continue.
+
+Details: `.cursor/rules/board-debug-chat.mdc`.
