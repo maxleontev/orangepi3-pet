@@ -1,8 +1,8 @@
 /*
  * Fullscreen Wayland panel: USB UVC preview + pan-servo track control.
  *
- * Selected when INFO_PANEL=track. Redesign home for object-follow:
- *   detect evidence → associate → track FSM → servo (only in LOCK).
+ * Selected when INFO_PANEL=track. Object-follow pipeline:
+ *   block-energy motion → associate → track FSM → servo (only in LOCK).
  * The old info-panel-camera frame-diff→EMA→Kalman→PID path stays untouched.
  *
  * Capture: V4L2 MMAP. Prefer YUYV (hub-stable), else MJPEG (libjpeg-turbo).
@@ -60,6 +60,24 @@
 #define SERVO_DUTY_CENTER_NS 1500000L
 #define SERVO_MAX_STEP_NS 80000L
 
+/* Motion evidence → candidate (camera pixel coords). No OpenCV. */
+#define MOTION_DIFF_THRESH 18
+#define MOTION_MIN_PIXELS 48
+#define MOTION_MIN_SEED_HITS 18
+#define MOTION_PAD_PX 8
+/* Allow large close-up motion (hand fills much of 320x240). */
+#define MOTION_MAX_FRAC_PCT 55
+#define MOTION_MAX_BBOX_AREA_PCT 70
+#define MOTION_GRID 16
+/* Keep mean small: a big moving mass must not cancel itself out. */
+#define MOTION_MEAN_CAP 3
+/* Track FSM / association. */
+#define TRACK_ACQUIRE_NEED 3
+#define TRACK_COAST_FRAMES 5
+#define TRACK_EGO_FRAMES 3
+#define TRACK_EMA_ALPHA 0.45f
+#define TRACK_GATE_FRAC 0.28f
+
 enum track_state {
 	TRACK_IDLE = 0,
 	TRACK_ACQUIRE,
@@ -108,9 +126,22 @@ struct cam_state {
 	size_t rgb_size;
 	unsigned rgb_w;
 	unsigned rgb_h;
+	/* Grayscale prev + mask for block-energy motion. */
+	uint8_t *gray_prev;
+	size_t gray_size;
+	uint8_t *motion_mask;
+	size_t mask_size;
+	bool motion_have_prev;
 };
 
-/* Horizontal track estimate in camera pixel coords (filled by detect later). */
+struct motion_candidate {
+	bool valid;
+	float cx, cy;
+	float half_w, half_h;
+	unsigned score;
+};
+
+/* Horizontal track estimate in camera pixel coords. */
 struct track_state_data {
 	enum track_state state;
 	bool have_target;
@@ -121,6 +152,9 @@ struct track_state_data {
 	unsigned acquire_hits;
 	unsigned miss_frames;
 	unsigned ego_frames;
+	/* Last frame diagnostics for the status bar. */
+	bool last_cand;
+	bool last_hit;
 };
 
 struct servo_state {
@@ -442,11 +476,11 @@ static void servo_follow_track(struct servo_state *sv, struct cam_state *cam,
 	step = (long)lroundf((float)sv->pan_sign * err * 400.f);
 	if (servo_nudge(sv, step)) {
 		tr->state = TRACK_EGO_BLIND;
-		tr->ego_frames = 3;
+		tr->ego_frames = TRACK_EGO_FRAMES;
 	}
 }
 
-/* ---- Track FSM (scaffold; detector fills measurements later) ------------ */
+/* ---- Motion evidence + track FSM ---------------------------------------- */
 
 static void track_reset(struct track_state_data *tr)
 {
@@ -454,26 +488,436 @@ static void track_reset(struct track_state_data *tr)
 	tr->state = TRACK_IDLE;
 }
 
+static void cam_motion_bufs_free(struct cam_state *cam)
+{
+	free(cam->gray_prev);
+	cam->gray_prev = NULL;
+	cam->gray_size = 0;
+	free(cam->motion_mask);
+	cam->motion_mask = NULL;
+	cam->mask_size = 0;
+	cam->motion_have_prev = false;
+}
+
+static void cam_fill_gray(struct cam_state *cam, unsigned w, unsigned h)
+{
+	unsigned x, y;
+
+	for (y = 0; y < h; y++) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		uint8_t *g = cam->gray_prev + (size_t)y * w;
+
+		for (x = 0; x < w; x++) {
+			const uint8_t *p = row + (size_t)x * 3u;
+
+			g[x] = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+		}
+	}
+}
+
+static bool cam_ensure_gray(struct cam_state *cam, unsigned w, unsigned h)
+{
+	size_t need = (size_t)w * (size_t)h;
+
+	if (cam->gray_prev && cam->gray_size >= need &&
+	    cam->motion_mask && cam->mask_size >= need)
+		return true;
+	cam_motion_bufs_free(cam);
+	cam->gray_prev = malloc(need);
+	cam->motion_mask = malloc(need);
+	if (!cam->gray_prev || !cam->motion_mask) {
+		cam_motion_bufs_free(cam);
+		return false;
+	}
+	cam->gray_size = need;
+	cam->mask_size = need;
+	cam->motion_have_prev = false;
+	return true;
+}
+
 /*
- * Per-frame hook after a new RGB frame. Placeholder: no detector yet, so
- * the FSM stays IDLE and the servo never pans. Association + evidence
- * scoring land here in a later change.
+ * Block-energy absdiff. Returns one connected motion blob or invalid.
+ * Soft flood-fill from densest cell, then bbox over mask pixels in that
+ * component (covers the whole blob, not only the peak edge). Still no
+ * fallback to the global extent of every changed pixel.
  */
+static struct motion_candidate motion_detect_candidate(struct cam_state *cam,
+						       bool reseeds_only)
+{
+	struct motion_candidate out = { 0 };
+	unsigned w = cam->rgb_w;
+	unsigned h = cam->rgb_h;
+	unsigned x, y;
+	unsigned count = 0;
+	unsigned max_pix;
+	uint16_t cell[MOTION_GRID][MOTION_GRID];
+	uint8_t visit[MOTION_GRID][MOTION_GRID];
+	int stack_x[MOTION_GRID * MOTION_GRID];
+	int stack_y[MOTION_GRID * MOTION_GRID];
+	int sp;
+	int seed_cx, seed_cy;
+	unsigned seed_hits, cell_thresh, soft_thresh;
+	int cell_x0, cell_y0, cell_x1, cell_y1;
+	int min_x, min_y, max_x, max_y;
+	unsigned cw, ch;
+	long sum_s = 0;
+	unsigned n_sub = 0;
+	int mean_s;
+	static const int dx4[4] = { 1, -1, 0, 0 };
+	static const int dy4[4] = { 0, 0, 1, -1 };
+
+	if (!cam->rgb || w < 2 || h < 2)
+		return out;
+	if (!cam_ensure_gray(cam, w, h))
+		return out;
+
+	if (!cam->motion_have_prev) {
+		cam_fill_gray(cam, w, h);
+		cam->motion_have_prev = true;
+		return out;
+	}
+
+	if (reseeds_only) {
+		cam_fill_gray(cam, w, h);
+		return out;
+	}
+
+	for (y = 0; y < h; y += 4) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		const uint8_t *gprev = cam->gray_prev + (size_t)y * w;
+
+		for (x = 0; x < w; x += 4) {
+			const uint8_t *p = row + (size_t)x * 3u;
+			uint8_t g = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+
+			sum_s += (int)g - (int)gprev[x];
+			n_sub++;
+		}
+	}
+	mean_s = n_sub ? (int)(sum_s / (long)n_sub) : 0;
+	if (mean_s > MOTION_MEAN_CAP)
+		mean_s = MOTION_MEAN_CAP;
+	else if (mean_s < -MOTION_MEAN_CAP)
+		mean_s = -MOTION_MEAN_CAP;
+
+	memset(cam->motion_mask, 0, (size_t)w * (size_t)h);
+	memset(cell, 0, sizeof(cell));
+	cw = (w + MOTION_GRID - 1) / MOTION_GRID;
+	ch = (h + MOTION_GRID - 1) / MOTION_GRID;
+	if (cw < 1)
+		cw = 1;
+	if (ch < 1)
+		ch = 1;
+
+	for (y = 0; y < h; y++) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		uint8_t *gprev = cam->gray_prev + (size_t)y * w;
+		uint8_t *mask = cam->motion_mask + (size_t)y * w;
+		unsigned cy = y / ch;
+
+		if (cy >= MOTION_GRID)
+			cy = MOTION_GRID - 1;
+		for (x = 0; x < w; x++) {
+			const uint8_t *p = row + (size_t)x * 3u;
+			uint8_t g = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+			int delta = (int)g - (int)gprev[x] - mean_s;
+			unsigned resid = delta < 0 ? (unsigned)(-delta) : (unsigned)delta;
+			unsigned cx_cell;
+
+			gprev[x] = g;
+			if (resid < MOTION_DIFF_THRESH)
+				continue;
+			mask[x] = 1;
+			count++;
+			cx_cell = x / cw;
+			if (cx_cell >= MOTION_GRID)
+				cx_cell = MOTION_GRID - 1;
+			cell[cy][cx_cell]++;
+		}
+	}
+
+	max_pix = (unsigned)(((unsigned long)w * (unsigned long)h *
+			      (unsigned long)MOTION_MAX_FRAC_PCT) / 100ul);
+	if (count > max_pix || count < MOTION_MIN_PIXELS)
+		return out;
+
+	seed_cx = seed_cy = 0;
+	seed_hits = 0;
+	for (y = 0; y < MOTION_GRID; y++) {
+		for (x = 0; x < MOTION_GRID; x++) {
+			if (cell[y][x] > seed_hits) {
+				seed_hits = cell[y][x];
+				seed_cx = (int)x;
+				seed_cy = (int)y;
+			}
+		}
+	}
+	if (seed_hits < MOTION_MIN_SEED_HITS)
+		return out;
+
+	/* Soft core: join cells that are a modest fraction of the peak. */
+	cell_thresh = seed_hits / 12u;
+	if (cell_thresh < 2u)
+		cell_thresh = 2u;
+	/* Then grow into weaker neighbors so the bbox covers the full blob. */
+	soft_thresh = seed_hits / 24u;
+	if (soft_thresh < 1u)
+		soft_thresh = 1u;
+
+	memset(visit, 0, sizeof(visit));
+	sp = 0;
+	stack_x[sp] = seed_cx;
+	stack_y[sp] = seed_cy;
+	sp++;
+	visit[seed_cy][seed_cx] = 1;
+	cell_x0 = cell_x1 = seed_cx;
+	cell_y0 = cell_y1 = seed_cy;
+
+	/* Phase 1 — dense core. */
+	while (sp > 0) {
+		int cx_cell, cy_cell;
+		int k;
+
+		sp--;
+		cx_cell = stack_x[sp];
+		cy_cell = stack_y[sp];
+		if (cx_cell < cell_x0)
+			cell_x0 = cx_cell;
+		if (cx_cell > cell_x1)
+			cell_x1 = cx_cell;
+		if (cy_cell < cell_y0)
+			cell_y0 = cy_cell;
+		if (cy_cell > cell_y1)
+			cell_y1 = cy_cell;
+		for (k = 0; k < 4; k++) {
+			int nx = cx_cell + dx4[k];
+			int ny = cy_cell + dy4[k];
+
+			if (nx < 0 || ny < 0 || nx >= MOTION_GRID || ny >= MOTION_GRID)
+				continue;
+			if (visit[ny][nx] || cell[ny][nx] < cell_thresh)
+				continue;
+			visit[ny][nx] = 1;
+			stack_x[sp] = nx;
+			stack_y[sp] = ny;
+			sp++;
+		}
+	}
+
+	/* Phase 2 — soft grow from every core cell. */
+	{
+		int grew = 1;
+
+		while (grew) {
+			int cy_cell, cx_cell, k;
+
+			grew = 0;
+			for (cy_cell = 0; cy_cell < MOTION_GRID; cy_cell++) {
+				for (cx_cell = 0; cx_cell < MOTION_GRID; cx_cell++) {
+					if (!visit[cy_cell][cx_cell])
+						continue;
+					for (k = 0; k < 4; k++) {
+						int nx = cx_cell + dx4[k];
+						int ny = cy_cell + dy4[k];
+
+						if (nx < 0 || ny < 0 ||
+						    nx >= MOTION_GRID || ny >= MOTION_GRID)
+							continue;
+						if (visit[ny][nx] || cell[ny][nx] < soft_thresh)
+							continue;
+						visit[ny][nx] = 1;
+						grew = 1;
+						if (nx < cell_x0)
+							cell_x0 = nx;
+						if (nx > cell_x1)
+							cell_x1 = nx;
+						if (ny < cell_y0)
+							cell_y0 = ny;
+						if (ny > cell_y1)
+							cell_y1 = ny;
+					}
+				}
+			}
+		}
+	}
+
+	min_x = (int)w;
+	min_y = (int)h;
+	max_x = -1;
+	max_y = -1;
+	{
+		unsigned x0 = (unsigned)cell_x0 * cw;
+		unsigned y0 = (unsigned)cell_y0 * ch;
+		unsigned x1 = (unsigned)(cell_x1 + 1) * cw;
+		unsigned y1 = (unsigned)(cell_y1 + 1) * ch;
+
+		if (x1 > w)
+			x1 = w;
+		if (y1 > h)
+			y1 = h;
+		for (y = y0; y < y1; y++) {
+			const uint8_t *mask = cam->motion_mask + (size_t)y * w;
+			unsigned cy = y / ch;
+
+			if (cy >= MOTION_GRID)
+				cy = MOTION_GRID - 1;
+			for (x = x0; x < x1; x++) {
+				unsigned cx_cell = x / cw;
+
+				if (cx_cell >= MOTION_GRID)
+					cx_cell = MOTION_GRID - 1;
+				if (!visit[cy][cx_cell] || !mask[x])
+					continue;
+				if ((int)x < min_x)
+					min_x = (int)x;
+				if ((int)x > max_x)
+					max_x = (int)x;
+				if ((int)y < min_y)
+					min_y = (int)y;
+				if ((int)y > max_y)
+					max_y = (int)y;
+			}
+		}
+	}
+
+	if (max_x < min_x || max_y < min_y)
+		return out;
+
+	{
+		int bw = max_x - min_x + 1;
+		int bh = max_y - min_y + 1;
+		unsigned long area = (unsigned long)bw * (unsigned long)bh;
+		unsigned long max_area =
+			((unsigned long)w * (unsigned long)h *
+			 (unsigned long)MOTION_MAX_BBOX_AREA_PCT) / 100ul;
+
+		if (area > max_area)
+			return out;
+
+		out.valid = true;
+		out.cx = 0.5f * (float)(min_x + max_x);
+		out.cy = 0.5f * (float)(min_y + max_y);
+		out.half_w = 0.5f * (float)bw + (float)MOTION_PAD_PX;
+		out.half_h = 0.5f * (float)bh + (float)MOTION_PAD_PX;
+		out.score = seed_hits;
+	}
+	return out;
+}
+
+static bool track_associate(struct track_state_data *tr, struct cam_state *cam,
+			    const struct motion_candidate *cand)
+{
+	float gate_x, gate_y;
+
+	if (!cand->valid)
+		return false;
+	if (!tr->have_target)
+		return true;
+
+	gate_x = TRACK_GATE_FRAC * (float)cam->rgb_w;
+	gate_y = TRACK_GATE_FRAC * (float)cam->rgb_h;
+	if (gate_x < 16.f)
+		gate_x = 16.f;
+	if (gate_y < 12.f)
+		gate_y = 12.f;
+	if (fabsf(cand->cx - tr->x) > gate_x)
+		return false;
+	if (fabsf(cand->cy - tr->y) > gate_y)
+		return false;
+	return true;
+}
+
+static void track_apply_measure(struct track_state_data *tr,
+				const struct motion_candidate *cand)
+{
+	if (!tr->have_target) {
+		tr->x = cand->cx;
+		tr->y = cand->cy;
+		tr->half_w = cand->half_w;
+		tr->half_h = cand->half_h;
+		tr->have_target = true;
+		return;
+	}
+	tr->x = TRACK_EMA_ALPHA * cand->cx + (1.f - TRACK_EMA_ALPHA) * tr->x;
+	tr->y = TRACK_EMA_ALPHA * cand->cy + (1.f - TRACK_EMA_ALPHA) * tr->y;
+	tr->half_w = TRACK_EMA_ALPHA * cand->half_w +
+		     (1.f - TRACK_EMA_ALPHA) * tr->half_w;
+	tr->half_h = TRACK_EMA_ALPHA * cand->half_h +
+		     (1.f - TRACK_EMA_ALPHA) * tr->half_h;
+	tr->have_target = true;
+}
+
 static void track_on_frame(struct track_state_data *tr, struct cam_state *cam)
 {
-	(void)cam;
+	struct motion_candidate cand;
+	bool hit;
 
-	switch (tr->state) {
-	case TRACK_EGO_BLIND:
+	tr->last_cand = false;
+	tr->last_hit = false;
+
+	if (tr->state == TRACK_EGO_BLIND) {
+		(void)motion_detect_candidate(cam, true);
 		if (tr->ego_frames > 0)
 			tr->ego_frames--;
 		if (tr->ego_frames == 0)
 			tr->state = tr->have_target ? TRACK_LOCK : TRACK_IDLE;
+		return;
+	}
+
+	cand = motion_detect_candidate(cam, false);
+	tr->last_cand = cand.valid;
+	hit = track_associate(tr, cam, &cand);
+	tr->last_hit = hit;
+
+	switch (tr->state) {
+	case TRACK_IDLE:
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->state = TRACK_ACQUIRE;
+			tr->acquire_hits = 1;
+			tr->miss_frames = 0;
+		}
+		break;
+	case TRACK_ACQUIRE:
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->acquire_hits++;
+			if (tr->acquire_hits >= TRACK_ACQUIRE_NEED) {
+				tr->state = TRACK_LOCK;
+				tr->miss_frames = 0;
+			}
+		} else if (tr->acquire_hits > 0) {
+			tr->acquire_hits--;
+			if (tr->acquire_hits == 0) {
+				tr->have_target = false;
+				tr->state = TRACK_IDLE;
+			}
+		} else {
+			tr->have_target = false;
+			tr->state = TRACK_IDLE;
+		}
+		break;
+	case TRACK_LOCK:
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->miss_frames = 0;
+		} else {
+			tr->state = TRACK_COAST;
+			tr->miss_frames = TRACK_COAST_FRAMES;
+		}
 		break;
 	case TRACK_COAST:
-		if (tr->miss_frames > 0)
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->state = TRACK_LOCK;
+			tr->miss_frames = 0;
+		} else if (tr->miss_frames > 0) {
 			tr->miss_frames--;
-		if (tr->miss_frames == 0) {
+			if (tr->miss_frames == 0) {
+				tr->have_target = false;
+				tr->state = TRACK_LOST;
+			}
+		} else {
 			tr->have_target = false;
 			tr->state = TRACK_LOST;
 		}
@@ -482,9 +926,7 @@ static void track_on_frame(struct track_state_data *tr, struct cam_state *cam)
 		tr->have_target = false;
 		tr->state = TRACK_IDLE;
 		break;
-	case TRACK_IDLE:
-	case TRACK_ACQUIRE:
-	case TRACK_LOCK:
+	case TRACK_EGO_BLIND:
 	default:
 		break;
 	}
@@ -528,6 +970,7 @@ static void cam_close(struct cam_state *cam)
 	cam->rgb = NULL;
 	cam->rgb_size = 0;
 	cam->rgb_w = cam->rgb_h = 0;
+	cam_motion_bufs_free(cam);
 	cam->have_frame = false;
 }
 
@@ -557,6 +1000,7 @@ static bool cam_ensure_rgb(struct cam_state *cam, unsigned w, unsigned h)
 	cam->rgb_size = need;
 	cam->rgb_w = w;
 	cam->rgb_h = h;
+	cam_motion_bufs_free(cam);
 	return true;
 }
 
@@ -1019,11 +1463,11 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 				   (uint32_t *)b->data, b->width, b->height, STATUS_H,
 				   &lb);
 
-	/* Track bbox only with a real target (LOCK / short COAST). */
+	/* Track bbox with a real target (acquire / lock / coast / brief ego). */
 	if (app->track.have_target && lb.vw > 0 && lb.vh > 0 &&
 	    app->cam.rgb_w > 0 && app->cam.rgb_h > 0 &&
 	    (app->track.state == TRACK_LOCK || app->track.state == TRACK_COAST ||
-	     app->track.state == TRACK_ACQUIRE)) {
+	     app->track.state == TRACK_ACQUIRE || app->track.state == TRACK_EGO_BLIND)) {
 		double sx = (double)lb.vw / (double)app->cam.rgb_w;
 		double sy = (double)lb.vh / (double)app->cam.rgb_h;
 		float hw = app->track.half_w > 4.f ? app->track.half_w : 4.f;
@@ -1056,10 +1500,30 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 			       CAIRO_FONT_WEIGHT_BOLD);
 	cairo_set_font_size(cr, 16);
 	cairo_set_source_rgb(cr, 0.85, 0.90, 0.95);
-	snprintf(line, sizeof(line), "Track  ·  %s  ·  %s%s",
-		 app->cam.status,
-		 track_state_name(app->track.state),
-		 app->servo.ready ? "  ·  servo" : "");
+	{
+		char st[48];
+
+		switch (app->track.state) {
+		case TRACK_ACQUIRE:
+			snprintf(st, sizeof(st), "acquire %u/%u",
+				 app->track.acquire_hits, TRACK_ACQUIRE_NEED);
+			break;
+		case TRACK_COAST:
+			snprintf(st, sizeof(st), "coast %u", app->track.miss_frames);
+			break;
+		case TRACK_EGO_BLIND:
+			snprintf(st, sizeof(st), "ego %u", app->track.ego_frames);
+			break;
+		default:
+			snprintf(st, sizeof(st), "%s", track_state_name(app->track.state));
+			break;
+		}
+		snprintf(line, sizeof(line), "Track  ·  %s  ·  %s%s%s%s",
+			 app->cam.status, st,
+			 app->track.last_cand ? "  ·  mot" : "",
+			 app->track.last_hit ? "+hit" : "",
+			 app->servo.ready ? "  ·  servo" : "");
+	}
 	cairo_move_to(cr, 14, 24);
 	cairo_show_text(cr, line);
 

@@ -134,8 +134,9 @@ Installed by whichever panel recipe is in the image (`info-panel`,
 
 `info-panel-camera` draws a yellow motion bbox (legacy frame-diff) and may
 PID-pan a hobby servo on CON12 pin 7 (HW PWM0 / PD22).
-`info-panel-track` is the redesigned follow panel (FSM + servo scaffold;
-detector not wired yet). `INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1`
+`info-panel-track` is the redesigned follow panel (block-energy motion →
+FSM; white acquire / yellow lock bbox; servo only while locked).
+`INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1`
 flips pan direction from the camera-on-servo default.
 
 ```bash

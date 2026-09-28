@@ -73,9 +73,12 @@ Fullscreen **info-panel-track**: UVC preview plus redesigned pan-servo follow
 (separate binary from `info-panel-camera`; old motion→PID path stays as-is).
 
 - Same V4L2 / letterbox / SIGUSR1 screenshot contract as the camera panel
-- Status bar shows track FSM state (`idle` / `acquire` / `lock` / …) and `servo`
-- Servo: HW PWM0 on PD22; `INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1`
-- Detector/association not wired yet — FSM stays `idle`, box/servo idle until filled in
+- Block-energy frame-diff → associate → FSM (`idle` / `acquire` / `lock` / `coast` / …)
+- Bbox: white while acquiring, yellow when locked, dim yellow while coasting
+- Servo pan is **off by default** in the unit (`INFO_PANEL_SERVO=0`) while
+  tuning motion/bbox; set `INFO_PANEL_SERVO=1` to re-enable PWM0 pan
+- Status bar: FSM state (`acquire 2/3`, `lock`, `coast N`, …), `mot`/`+hit`
+  when the detector saw / accepted a blob this frame
 - Capture target ~10 fps (`FRAME_MS=100`); UI still respects busy wl_shm buffers
 
 ---
@@ -222,8 +225,10 @@ Meson + Wayland client (`info-panel-camera.c`) + `info-panel-camera.service`.
 Meson + Wayland client (`info-panel-track.c`) + `info-panel-track.service`.
 
 - Installed when `INFO_PANEL = "track"` in `local.conf`.
-- UVC preview + pan-servo control scaffold (FSM: idle/acquire/lock/coast/ego/lost).
-- Does **not** reuse the camera panel’s frame-diff→PID path; detector filled in later.
+- UVC preview + pan-servo: block-energy motion → soft connected blob → FSM
+  (idle/acquire/lock/coast/ego/lost). Bbox covers the blob, not only the peak edge.
+- White bbox while acquiring; yellow when locked; servo only in lock
+  (`INFO_PANEL_SERVO=0` while tuning motion).
 - Same UVC udev/modprobe snippets and PWM0 export as the camera service.
 - Installs shared `/usr/sbin/hdmi-screenshot`.
 
