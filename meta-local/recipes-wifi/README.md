@@ -6,7 +6,7 @@ UI when STA cannot join a router.
 
 | Recipe | Role |
 |--------|------|
-| `wifi-init/` | `wifi.service` / `wifi-roam.service` / `wifi-watch.service`, scripts, setup web UI, lighttpd config |
+| `wifi-init/` | `wifi.service` / `wifi-roam.service` / `wifi-usb.service`, scripts, setup web UI, lighttpd config |
 | `fw-ap6256/` | Board-specific brcmfmac NVRAM (`brcmfmac43456-sdio.txt`) |
 
 Related pieces outside this folder:
@@ -27,14 +27,10 @@ Related pieces outside this folder:
 2. Reads `/data/wifi.conf` (wpa_supplicant format)
 3. Associates, runs DHCP (`udhcpc`), writes `/run/wifi-mode=sta`
 4. `wifi-roam` may switch among configured SSIDs by measured RSSI
-5. `wifi-watch` flushes the address and reassociates when `wpa_state` is
-   not `COMPLETED`, or when the IPv4 default gateway on `wlan0` does not
-   answer. That address is written to `GATEWAY` from the route (`default
-   via …` installed by DHCP), not a fixed host. It calls `enable_network
-   all`, never `select_network`. Setup AP mode is left alone. Each
-   recovery increments `/run/wifi-watch-count` (starts at `0` when the
-   service starts).
-
+5. `wifi-usb.service` → `/usr/sbin/wifi-usb-connect` (long-running) brings up
+   a secondary USB stick (e.g. TL-WN722N / `ath9k_htc`) with the same conf;
+   default route metric is higher so `wlan0` stays preferred. No stick → idle
+   and retry. Unplug/replug or lost IPv4 after re-join → connect and DHCP again.
 ### Setup AP (fallback)
 
 Triggered when `/data/wifi.conf` has no `network={}` blocks, or STA
@@ -96,6 +92,7 @@ and connect**.
 | Command | Role |
 |---------|------|
 | `/usr/sbin/wifi-connect` | Boot/oneshot STA or setup AP |
+| `/usr/sbin/wifi-usb-connect` | Long-running STA on USB WiFi (secondary); recovers after unplug / drop |
 | `/usr/sbin/wifi-ap-start` / `wifi-ap-stop` | Setup AP lifecycle |
 | `/usr/sbin/wifi-write-config` | Write `ssid:psk` pairs into `/data/wifi.conf` |
 | `/usr/sbin/wifi-scan` | Scan / cache SSIDs for the UI |

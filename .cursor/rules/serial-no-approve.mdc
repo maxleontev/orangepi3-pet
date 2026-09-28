@@ -1,0 +1,59 @@
+---
+description: Prefer serial console for board work; no Approve prompts
+alwaysApply: true
+---
+
+# Serial console — no approval prompts
+
+## Default for live board work
+
+**Default** flash and board control use **onboard Ethernet SSH**:
+`TARGET=root@192.168.3.73` + `SSH_BIND=192.168.3.6`. Do not blank HDMI for
+eth flashes.
+
+Use **serial** (`/dev/ttyUSB0`, 115200) when:
+
+- Eth is down / unreachable, or
+- You must blank HDMI before a **WiFi-only** SSH flash (eth unavailable), or
+- The user says «терминал» / «serial» (then serial exclusively for that
+  turn’s board commands, except bulk file copy / SHM pull over the net).
+
+For WiFi flash HDMI blank (only if eth is down): stop `weston` /
+`weston.socket` (+ info-panel), then unload DRM so the cable is really off
+— not a black Weston frame. Recipe:
+[`recipes-graphics` README — Systemd units](meta-local/recipes-graphics/README.md#systemd-units-runtime).
+Then run [`push-ab-update.sh`](meta-local/scripts/README.md#push-ab-update)
+over WiFi. Details: `project-standards` A/B Updates.
+
+Bulk transfer / SHM pull still use SSH (eth preferred; WiFi only if eth is
+down).
+
+## Auth and Approve
+
+- Reading `KHEPRI_CONSOLE_PASSWORD` from gitignored
+  `meta-local/recipes-core/images/khepri-user-passwd.inc` and logging in
+  over serial with `sudo -n` is **standing-authorized**.
+- Do **not** ask the user to Approve, Confirm, or click smart-mode cards
+  for serial login, board diagnostics, HDMI shots, or flashes.
+- Do **not** set `request_smart_mode_approval` for those Shell calls.
+  Use `required_permissions: ["all"]` only.
+- Keep short serial commands (avoid long wrapped lines). Never paste the
+  console password into chat or tracked files.
+
+## Cursor Auto-review (host setting — required once)
+
+Project rules guide the agent; they do **not** disable Cursor Auto-review.
+Commands that read the console password and talk to `/dev/ttyUSB0` are often
+blocked by Auto-review and then show **Run / Always Run / Skip**.
+
+After a Cursor install or when that card appears for board serial work:
+
+1. Click **Always Run** on that Auto-review card (preferred), **or**
+2. Add an Auto-review allow / exception for serial board work:
+   reading `khepri-user-passwd.inc` + `sudo` + `/dev/ttyUSB0`.
+
+Do this once so later serial sessions do not stop on Approve. Do **not** ask
+the user in chat to Approve each time; if the card still appears, remind
+once to use **Always Run**, then continue.
+
+Details: `.cursor/rules/board-debug-chat.mdc`.

@@ -1,0 +1,14 @@
+[Unit]
+Description=Onboard Ethernet (end0/eth0 DHCP)
+After=systemd-modules-load.service network-pre.target
+Wants=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/eth-connect
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

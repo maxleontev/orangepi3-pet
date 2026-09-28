@@ -15,11 +15,17 @@ SRC_URI:append:orange-pi-3 = " file://f2fs.cfg"
 # USB UVC webcams (/dev/video*) for info-panel-camera.
 SRC_URI:append:orange-pi-3 = " file://uvc.cfg"
 
+# TP-Link TL-WN722N v1 (AR9271) and other ath9k_htc USB WiFi sticks.
+SRC_URI:append:orange-pi-3 = " file://ath9k-htc.cfg"
+
 # H6 USB3 PHY for Type-A ports (GL3510 hub on dwc3); without it no USB hosts.
 SRC_URI:append:orange-pi-3 = " file://usb3-phy.cfg"
 
 # Onboard analog microphone: kernel bits from recipe ac200-audio.
 require recipes-multimedia/ac200-audio/ac200-audio-kernel.inc
+
+# Onboard Gigabit Ethernet (RTL8211E) — mainline DTS left &emac disabled.
+SRC_URI:append:orange-pi-3 = " file://0001-arm64-dts-orangepi-3-enable-ethernet.patch"
 
 # files/drm.cfg overrides meta-sunxi's fragment (same file://drm.cfg name)
 # when MACHINEOVERRIDES includes use-mailine-graphics.

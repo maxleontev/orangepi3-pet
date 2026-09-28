@@ -42,8 +42,8 @@ After boot (Wi‑Fi up, then compositor), a fullscreen **info-panel** client dra
 - **CPU temperature** (°C) from `/sys/class/thermal` (prefer `cpu-thermal`) or hwmon  
 - **Per-core CPU usage** (%) from `/proc/stat` deltas (needs ≥1 refresh interval between samples)  
 - Memory used / total and a simple bar  
-- IPv4 address and interface (prefers `wlan0`)  
-- **WiFi SSID** via `/usr/sbin/iw dev wlan0 link`  
+- **Addresses** — table of up IPv4 ifaces: IP, name, type (WiFi/Eth/…), SSID when WiFi  
+- AP SSID / AP IP (unchanged)  
 - Footer: Wayland/Weston · Mali (Lima)
 
 **Bottom ~44%**

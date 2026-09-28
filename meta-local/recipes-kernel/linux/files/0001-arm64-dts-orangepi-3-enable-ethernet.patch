@@ -1,0 +1,86 @@
+From: Max Leontev <maxleontev@gmail.com>
+Date: Sun, 27 Sep 2026 22:40:00 +0800
+Subject: [PATCH] arm64: dts: allwinner: orangepi-3: enable RGMII ethernet
+
+Mainline leaves &emac disabled. Enable RTL8211E with the Orange Pi 3
+(non-LTS) layout from the sunxi enable series: 2.5V RGMII IO (PD6),
+phy-mode rgmii-id (PHY delay, no MAC delay), PHY reset on PD14.
+
+Kernel 6.6 has no phy-io-supply in the PHY core, so keep phy-supply on
+&emac to enable gmac-2v5 via dwmac-sun8i.
+
+Upstream-Status: Pending
+
+Signed-off-by: Max Leontev <maxleontev@gmail.com>
+---
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts	2026-09-27 22:34:42.389976680 +0800
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h6-orangepi-3.dts	2026-09-27 22:34:54.401918616 +0800
+@@ -13,6 +13,7 @@
+ 	compatible = "xunlong,orangepi-3", "allwinner,sun50i-h6";
+ 
+ 	aliases {
++		ethernet0 = &emac;
+ 		serial0 = &uart0;
+ 		serial1 = &uart1;
+ 	};
+@@ -83,6 +84,22 @@
+ 		regulator-always-on;
+ 	};
+ 
++
++	/*
++	 * Orange Pi 3 uses 2.5V RGMII signalling (PD6). Parent is the 5V
++	 * rail; ALDO2 (3.3V PHY) is always-on and shared with audio.
++	 */
++	reg_gmac_2v5: gmac-2v5 {
++		compatible = "regulator-fixed";
++		regulator-name = "gmac-2v5";
++		regulator-min-microvolt = <2500000>;
++		regulator-max-microvolt = <2500000>;
++		enable-active-high;
++		gpio = <&pio 3 6 GPIO_ACTIVE_HIGH>; /* PD6 */
++		off-on-delay-us = <100000>;
++		vin-supply = <&reg_vcc5v>;
++	};
++
+ 	reg_vcc33_wifi: vcc33-wifi {
+ 		/* Always on 3.3V regulator for WiFi and BT */
+ 		compatible = "regulator-fixed";
+@@ -145,6 +162,16 @@
+ 	status = "okay";
+ };
+ 
++
++&emac {
++	pinctrl-names = "default";
++	pinctrl-0 = <&ext_rgmii_pins>;
++	phy-mode = "rgmii-id";
++	phy-handle = <&ext_rgmii_phy>;
++	phy-supply = <&reg_gmac_2v5>;
++	status = "okay";
++};
++
+ &gpu {
+ 	mali-supply = <&reg_dcdcc>;
+ 	status = "okay";
+@@ -173,6 +200,20 @@
+ 	status = "okay";
+ };
+ 
++
++&mdio {
++	ext_rgmii_phy: ethernet-phy@1 {
++		compatible = "ethernet-phy-id001c.c915",
++			     "ethernet-phy-ieee802.3-c22";
++		reg = <1>;
++		reset-gpios = <&pio 3 14 GPIO_ACTIVE_LOW>; /* PD14 */
++		reset-assert-us = <15000>;
++		reset-deassert-us = <40000>;
++		eee-broken-100tx;
++		eee-broken-1000t;
++	};
++};
++
+ &mmc0 {
+ 	vmmc-supply = <&reg_cldo1>;
+ 	cd-gpios = <&pio 5 6 GPIO_ACTIVE_LOW>; /* PF6 */

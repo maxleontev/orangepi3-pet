@@ -9,7 +9,9 @@ LICENSE = "MIT"
 # override the key dir onto /data below so host keys survive reboot).
 IMAGE_FEATURES += "splash read-only-rootfs"
 
-IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init hostapd dnsmasq mc sd-to-emmc root-ssh-keys ab-update"
+IMAGE_INSTALL:append = " fw-ap6256 wpa-supplicant iw wifi-init hostapd dnsmasq mc sd-to-emmc root-ssh-keys ab-update eth-init"
+# TL-WN722N v1 (AR9271): ath9k_htc module + htc_9271 firmware.
+IMAGE_INSTALL:append = " kernel-module-ath9k-htc linux-firmware-ath9k"
 IMAGE_INSTALL:append = " weston weston-init kmscube display-rf-blacklist"
 IMAGE_INSTALL:append = " ac200-audio"
 # INFO_PANEL from orangepi3-graphics.inc / local.conf: stats|camera|track.

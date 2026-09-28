@@ -1,0 +1,19 @@
+---
+description: Prefer plain language in chat; avoid jargon
+alwaysApply: true
+---
+
+# Plain language in chat
+
+When explaining design, networking, or board behavior to the user:
+
+- Prefer everyday words over insider terms.
+- If a technical name is needed (service, file, command), keep it, but say what it *does* in plain words next to it.
+- Do not stack unexplained abbreviations or slang (metric, STA, oneshot, orchestrator, layer-2, …) without a short plain gloss.
+- Prefer short concrete sentences over dense technical summaries.
+
+```
+Bad:  oneshot waits for COMPLETED then raises default-route metric
+Good: the script waits until Wi‑Fi is fully joined, then gets an IP;
+      the USB stick’s route is marked less preferred than the onboard one
+```

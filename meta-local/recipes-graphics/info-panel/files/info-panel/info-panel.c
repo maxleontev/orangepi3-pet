@@ -1,6 +1,7 @@
 /*
- * Fullscreen Wayland info panel: CPU temp/usage, memory, uptime, STA IP/SSID,
- * setup-AP SSID/IP when hostapd mode is active, and a live mic spectrum.
+ * Fullscreen Wayland info panel: CPU temp/usage, memory, uptime, a table of
+ * up IPv4 addresses (iface / type / SSID), setup-AP SSID/IP when hostapd
+ * mode is active, and a live mic spectrum.
  * Composited by Weston on DRM/KMS; GPU path is Mesa Lima (Mali).
  *
  * ---------------------------------------------------------------------------
@@ -100,6 +101,7 @@
 #include <math.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -128,7 +130,7 @@
 #define MIC_PERIOD 1024
 #define MIC_BUFFER 8192
 #define MIC_RETRY_MS 2000
-#define INFO_SPLIT 0.56
+#define INFO_SPLIT 0.60
 
 /* Handshake with /usr/sbin/hdmi-screenshot (atomic rename onto SHOT_PNG). */
 #define SHOT_PNG "/tmp/info-panel-screenshot.png"
@@ -153,6 +155,15 @@
 #define POLL_MIN_MS 10
 #define MAX_POLL_FDS 8
 
+#define MAX_NET_ROWS 8
+
+struct net_addr_row {
+	char ip[INET_ADDRSTRLEN];
+	char iface[32];
+	char type[8]; /* WiFi / Eth / Other */
+	char ssid[33]; /* empty if not WiFi or unknown */
+};
+
 struct panel_metrics {
 	double cpu_c;
 	bool cpu_ok;
@@ -162,9 +173,8 @@ struct panel_metrics {
 	unsigned long mem_total_kb;
 	unsigned long mem_avail_kb;
 	char uptime[32];
-	char ip[INET_ADDRSTRLEN];
-	char iface[32];
-	char wifi_ssid[33]; /* IEEE 802.11 SSID max 32 octets */
+	struct net_addr_row nets[MAX_NET_ROWS];
+	int nnets;
 	char ap_ssid[33];
 	char ap_ip[INET_ADDRSTRLEN];
 	char hostname[64];
@@ -553,24 +563,42 @@ static void read_primary_ipv4(char *ip, size_t iplen, char *iface, size_t iflen)
 	freeifaddrs(ifaddr);
 }
 
-/* Prefer iw (works as weston user); wpa_cli ctrl iface is often root-only.
- * Use absolute path — weston's systemd PATH may omit /usr/sbin.
- */
-static void read_wifi_ssid(char *ssid, size_t len)
+static bool net_is_wireless(const char *iface)
 {
-	static const char *const cmds[] = {
-		"/usr/sbin/iw dev wlan0 link 2>/dev/null",
-		"/sbin/iw dev wlan0 link 2>/dev/null",
-		"iw dev wlan0 link 2>/dev/null",
+	char path[128];
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/phy80211", iface);
+	if (access(path, F_OK) == 0)
+		return true;
+	snprintf(path, sizeof(path), "/sys/class/net/%s/wireless", iface);
+	return access(path, F_OK) == 0;
+}
+
+static bool net_is_ethernet(const char *iface)
+{
+	if (strncmp(iface, "eth", 3) == 0 || strncmp(iface, "en", 2) == 0)
+		return !net_is_wireless(iface);
+	return false;
+}
+
+/* Prefer iw (works as weston user); wpa_cli ctrl iface is often root-only. */
+static void read_wifi_ssid_iface(const char *iface, char *ssid, size_t len)
+{
+	char cmd[160];
+	static const char *const iw_bins[] = {
+		"/usr/sbin/iw",
+		"/sbin/iw",
+		"iw",
 		NULL,
 	};
 	FILE *f = NULL;
 	char line[256];
 	int i;
 
-	snprintf(ssid, len, "-");
-	for (i = 0; cmds[i]; i++) {
-		f = popen(cmds[i], "r");
+	snprintf(ssid, len, "");
+	for (i = 0; iw_bins[i]; i++) {
+		snprintf(cmd, sizeof(cmd), "%s dev %s link 2>/dev/null", iw_bins[i], iface);
+		f = popen(cmd, "r");
 		if (f)
 			break;
 	}
@@ -596,6 +624,79 @@ static void read_wifi_ssid(char *ssid, size_t len)
 		break;
 	}
 	pclose(f);
+}
+
+static int net_sort_key(const char *iface)
+{
+	if (strcmp(iface, "wlan0") == 0)
+		return 0;
+	if (net_is_wireless(iface))
+		return 1;
+	if (net_is_ethernet(iface))
+		return 2;
+	return 3;
+}
+
+/* One row per iface that currently has an IPv4 address (skip lo). */
+static void read_net_addrs(struct panel_metrics *m)
+{
+	struct ifaddrs *ifaddr = NULL, *ifa;
+	int i, j;
+
+	m->nnets = 0;
+	if (getifaddrs(&ifaddr) != 0)
+		return;
+
+	for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+		struct net_addr_row *row;
+		struct sockaddr_in *sin;
+		bool dup = false;
+
+		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+			continue;
+		if (strncmp(ifa->ifa_name, "lo", 2) == 0)
+			continue;
+		if (!(ifa->ifa_flags & IFF_UP))
+			continue;
+
+		for (i = 0; i < m->nnets; i++) {
+			if (strcmp(m->nets[i].iface, ifa->ifa_name) == 0) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup || m->nnets >= MAX_NET_ROWS)
+			continue;
+
+		row = &m->nets[m->nnets];
+		memset(row, 0, sizeof(*row));
+		sin = (struct sockaddr_in *)ifa->ifa_addr;
+		inet_ntop(AF_INET, &sin->sin_addr, row->ip, sizeof(row->ip));
+		snprintf(row->iface, sizeof(row->iface), "%s", ifa->ifa_name);
+		if (net_is_wireless(ifa->ifa_name)) {
+			snprintf(row->type, sizeof(row->type), "WiFi");
+			read_wifi_ssid_iface(ifa->ifa_name, row->ssid, sizeof(row->ssid));
+		} else if (net_is_ethernet(ifa->ifa_name)) {
+			snprintf(row->type, sizeof(row->type), "Eth");
+		} else {
+			snprintf(row->type, sizeof(row->type), "Other");
+		}
+		m->nnets++;
+	}
+	freeifaddrs(ifaddr);
+
+	/* Stable preference: wlan0, other WiFi, Eth, rest. */
+	for (i = 0; i < m->nnets; i++) {
+		for (j = i + 1; j < m->nnets; j++) {
+			if (net_sort_key(m->nets[j].iface) < net_sort_key(m->nets[i].iface) ||
+			    (net_sort_key(m->nets[j].iface) == net_sort_key(m->nets[i].iface) &&
+			     strcmp(m->nets[j].iface, m->nets[i].iface) < 0)) {
+				struct net_addr_row tmp = m->nets[i];
+				m->nets[i] = m->nets[j];
+				m->nets[j] = tmp;
+			}
+		}
+	}
 }
 
 static void read_uptime(char *buf, size_t len)
@@ -744,8 +845,7 @@ static void metrics_refresh(struct panel_metrics *m)
 	read_cpu_core_usage(m);
 	read_meminfo(&m->mem_total_kb, &m->mem_avail_kb);
 	read_uptime(m->uptime, sizeof(m->uptime));
-	read_primary_ipv4(m->ip, sizeof(m->ip), m->iface, sizeof(m->iface));
-	read_wifi_ssid(m->wifi_ssid, sizeof(m->wifi_ssid));
+	read_net_addrs(m);
 	read_ap_info(m->ap_ssid, sizeof(m->ap_ssid), m->ap_ip, sizeof(m->ap_ip));
 	if (gethostname(m->hostname, sizeof(m->hostname)) != 0)
 		snprintf(m->hostname, sizeof(m->hostname), "orangepi3");
@@ -1366,16 +1466,31 @@ static void draw_stats(struct app *app, cairo_t *cr, double w, double h)
 	cairo_show_text(cr, line);
 
 	y += row;
-	snprintf(line, sizeof(line), "IP address          %s  (%s)", m->ip, m->iface);
-	cairo_move_to(cr, x, y);
-	cairo_show_text(cr, line);
+	if (m->nnets <= 0) {
+		snprintf(line, sizeof(line), "IP                  -");
+		cairo_move_to(cr, x, y);
+		cairo_show_text(cr, line);
+		y += row;
+	} else {
+		cairo_set_source_rgb(cr, 0.55, 0.65, 0.75);
+		snprintf(line, sizeof(line), "%-15s %-8s %-5s %s",
+			 "IP", "IFACE", "TYPE", "SSID");
+		cairo_move_to(cr, x, y);
+		cairo_show_text(cr, line);
+		y += row * 0.95;
+		cairo_set_source_rgb(cr, 0.75, 0.82, 0.90);
+		for (int ni = 0; ni < m->nnets; ni++) {
+			const struct net_addr_row *n = &m->nets[ni];
+			const char *ssid = n->ssid[0] ? n->ssid : "";
 
-	y += row;
-	snprintf(line, sizeof(line), "WiFi                %s", m->wifi_ssid);
-	cairo_move_to(cr, x, y);
-	cairo_show_text(cr, line);
+			snprintf(line, sizeof(line), "%-15s %-8s %-5s %s",
+				 n->ip, n->iface, n->type, ssid);
+			cairo_move_to(cr, x, y);
+			cairo_show_text(cr, line);
+			y += row;
+		}
+	}
 
-	y += row;
 	snprintf(line, sizeof(line), "AP SSID             %s", m->ap_ssid);
 	cairo_move_to(cr, x, y);
 	cairo_show_text(cr, line);
