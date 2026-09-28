@@ -102,8 +102,8 @@
 /* Track FSM / association. */
 #define TRACK_ACQUIRE_NEED 3
 #define TRACK_COAST_FRAMES 5
-/* Blind after a one-shot pan (~1.2s at 10 fps) while the camera settles. */
-#define TRACK_EGO_FRAMES 12
+/* Blind after a one-shot pan (~0.6s at 10 fps) while the camera settles. */
+#define TRACK_EGO_FRAMES 6
 #define TRACK_EMA_ALPHA 0.45f
 #define TRACK_GATE_FRAC 0.28f
 /* Skip slew when already near center (~6% of width). */
@@ -197,12 +197,26 @@ struct servo_state {
 	volatile uint32_t *pwm_regs; /* /dev/mem map of 300a000.pwm */
 	uint32_t period_ticks; /* HW counter period (PRD+1) */
 	bool use_mmio;
-	/* Boot sweep before motion detect / follow. */
+	/*
+	 * Non-blocking edge↔edge test pan. While boot != DONE, follow-pan is
+	 * paused; camera grab / motion bbox / HDMI paint keep running.
+	 */
 	enum {
 		SERVO_BOOT_WAIT_VIDEO = 0,
 		SERVO_BOOT_GO,
 		SERVO_BOOT_DONE,
 	} boot;
+	enum {
+		SWEEP_LEG_HOME = 0,
+		SWEEP_LEG_TRIP,
+		SWEEP_LEG_CENTER,
+	} sweep_leg;
+	unsigned sweep_trip; /* 0 .. SERVO_SWEEP_TRIPS-1 while LEG_TRIP */
+	long sweep_from_ns;
+	long sweep_to_ns;
+	uint64_t sweep_t0_ms;
+	unsigned sweep_dur_ms;
+	uint64_t sweep_hold_until_ms;
 };
 
 struct app {
@@ -645,126 +659,152 @@ static bool servo_slew(struct servo_state *sv, long delta_ns)
 }
 
 /*
- * Blocking cosine ramp: one duty write per servo PWM period (20 ms).
- * Ease-in/out avoids bang starts; MMIO path avoids sun4i CTRL glitches.
- * Drain UVC between slices so a multi-second ramp does not stall the cam.
+ * Non-blocking cosine ramp for the test pan. Advanced from the main loop so
+ * grab/bbox/render stay on the normal path; only follow-pan is gated off.
  */
-static void cam_drain(struct cam_state *cam);
-
-static void servo_ramp_smooth(struct servo_state *sv, struct cam_state *cam,
-			      long target)
+static unsigned servo_ramp_dur_ms(long from, long to)
 {
-	long from = sv->duty_ns;
-	long span = target - from;
+	long span = to - from;
 	long abs_span = span < 0 ? -span : span;
 	long full = SERVO_DUTY_MAX_NS - SERVO_DUTY_MIN_NS;
-	unsigned dur_ms;
-	unsigned nsteps;
-	unsigned i;
-	struct timespec next;
+	unsigned dur_ms = (unsigned)SERVO_SWEEP_ONEWAY_MS;
 
-	if (!sv->enabled || !sv->ready)
-		return;
-	if (abs_span < 1) {
-		(void)servo_set_duty(sv, target);
-		return;
-	}
-
-	dur_ms = (unsigned)SERVO_SWEEP_ONEWAY_MS;
 	if (full > 0 && abs_span < full) {
 		dur_ms = (unsigned)((unsigned long)SERVO_SWEEP_ONEWAY_MS *
 				   (unsigned long)abs_span / (unsigned long)full);
 		if (dur_ms < 500u)
 			dur_ms = 500u;
 	}
-
-	nsteps = (dur_ms * 1000u) / (unsigned)SERVO_SWEEP_SLICE_US;
-	if (nsteps < 1u)
-		nsteps = 1u;
-
-	clock_gettime(CLOCK_MONOTONIC, &next);
-	for (i = 1; i <= nsteps; i++) {
-		double t = (double)i / (double)nsteps;
-		double s = 0.5 - 0.5 * cos(M_PI * t);
-		long duty = from + (long)llround((double)span * s);
-
-		(void)servo_set_duty(sv, duty);
-		if (cam && (i % 5u) == 0u)
-			cam_drain(cam);
-		next.tv_nsec += (long)SERVO_SWEEP_SLICE_US * 1000L;
-		if (next.tv_nsec >= 1000000000L) {
-			next.tv_sec += 1;
-			next.tv_nsec -= 1000000000L;
-		}
-		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
-	}
-	(void)servo_set_duty(sv, target);
-	if (cam)
-		cam_drain(cam);
+	return dur_ms;
 }
 
-static void servo_run_edge_sweep(struct servo_state *sv, struct cam_state *cam,
-				 struct track_state_data *tr)
+static void servo_sweep_begin_leg(struct servo_state *sv, long target,
+				  uint64_t now_ms)
 {
-	unsigned i;
-	char buf[32];
+	sv->sweep_from_ns = sv->duty_ns;
+	sv->sweep_to_ns = target;
+	sv->sweep_t0_ms = now_ms;
+	sv->sweep_dur_ms = servo_ramp_dur_ms(sv->sweep_from_ns, target);
+	sv->sweep_hold_until_ms = 0;
+}
 
+static bool servo_sweep_leg_tick(struct servo_state *sv, uint64_t now_ms)
+{
+	uint64_t elapsed;
+	double t;
+	double s;
+	long duty;
+	long span;
+
+	if (sv->sweep_hold_until_ms != 0) {
+		if (now_ms < sv->sweep_hold_until_ms)
+			return false;
+		sv->sweep_hold_until_ms = 0;
+		return true;
+	}
+
+	span = sv->sweep_to_ns - sv->sweep_from_ns;
+	if (span == 0) {
+		(void)servo_set_duty(sv, sv->sweep_to_ns);
+		sv->sweep_hold_until_ms = now_ms +
+			(uint64_t)SERVO_SWEEP_EDGE_HOLD_MS;
+		return false;
+	}
+
+	elapsed = now_ms - sv->sweep_t0_ms;
+	if (elapsed >= (uint64_t)sv->sweep_dur_ms) {
+		(void)servo_set_duty(sv, sv->sweep_to_ns);
+		sv->sweep_hold_until_ms = now_ms +
+			(uint64_t)SERVO_SWEEP_EDGE_HOLD_MS;
+		return false;
+	}
+
+	t = (double)elapsed / (double)sv->sweep_dur_ms;
+	s = 0.5 - 0.5 * cos(M_PI * t);
+	duty = sv->sweep_from_ns + (long)llround((double)span * s);
+	(void)servo_set_duty(sv, duty);
+	return false;
+}
+
+static void servo_sweep_start(struct servo_state *sv, uint64_t now_ms)
+{
 	fprintf(stderr, "info-panel-track: boot sweep %u× edge-to-edge\n",
 		SERVO_SWEEP_TRIPS);
 	sweep_status_write("running");
-
+	sv->boot = SERVO_BOOT_GO;
+	sv->sweep_leg = SWEEP_LEG_HOME;
+	sv->sweep_trip = 0;
 	sweep_status_write("home");
-	servo_ramp_smooth(sv, cam, SERVO_DUTY_MIN_NS);
-	usleep((useconds_t)SERVO_SWEEP_EDGE_HOLD_MS * 1000u);
-
-	for (i = 0; i < SERVO_SWEEP_TRIPS; i++) {
-		long tgt = (i % 2u == 0u) ? SERVO_DUTY_MAX_NS : SERVO_DUTY_MIN_NS;
-
-		snprintf(buf, sizeof(buf), "sweep %u/%u", i + 1u, SERVO_SWEEP_TRIPS);
-		sweep_status_write(buf);
-		servo_ramp_smooth(sv, cam, tgt);
-		usleep((useconds_t)SERVO_SWEEP_EDGE_HOLD_MS * 1000u);
-	}
-
-	sweep_status_write("center");
-	servo_ramp_smooth(sv, cam, SERVO_DUTY_CENTER_NS);
-
-	cam->motion_have_prev = false;
-	track_reset(tr);
-	sv->boot = SERVO_BOOT_DONE;
-	sweep_status_write("idle");
-	fprintf(stderr, "info-panel-track: boot sweep done → track\n");
+	servo_sweep_begin_leg(sv, SERVO_DUTY_MIN_NS, now_ms);
 }
 
-static bool servo_boot_ready(const struct servo_state *sv)
+static bool servo_follow_allowed(const struct servo_state *sv)
 {
-	return !sv->enabled || sv->boot == SERVO_BOOT_DONE;
+	return sv->enabled && sv->ready && sv->boot == SERVO_BOOT_DONE;
 }
 
-static void servo_boot_tick(struct servo_state *sv, struct cam_state *cam,
-			    struct track_state_data *tr, bool have_video,
+static bool servo_sweep_active(const struct servo_state *sv)
+{
+	return sv->enabled && sv->ready && sv->boot != SERVO_BOOT_DONE;
+}
+
+static void servo_boot_tick(struct servo_state *sv, bool have_video,
 			    uint64_t now_ms)
 {
-	(void)now_ms;
+	char buf[32];
+	long trip_tgt;
 
 	if (!sv->enabled || !sv->ready) {
 		sv->boot = SERVO_BOOT_DONE;
 		return;
 	}
-	if (sv->boot == SERVO_BOOT_DONE)
-		return;
 
-	switch (sv->boot) {
-	case SERVO_BOOT_WAIT_VIDEO:
+	if (sv->boot == SERVO_BOOT_WAIT_VIDEO) {
 		if (!have_video)
 			return;
-		servo_run_edge_sweep(sv, cam, tr);
+		servo_sweep_start(sv, now_ms);
+		return;
+	}
+
+	if (sv->boot != SERVO_BOOT_GO)
+		return;
+
+	if (!servo_sweep_leg_tick(sv, now_ms))
+		return;
+
+	/* Leg finished (including edge hold) → next phase. */
+	switch (sv->sweep_leg) {
+	case SWEEP_LEG_HOME:
+		sv->sweep_leg = SWEEP_LEG_TRIP;
+		sv->sweep_trip = 0;
+		trip_tgt = SERVO_DUTY_MAX_NS;
+		snprintf(buf, sizeof(buf), "sweep 1/%u", SERVO_SWEEP_TRIPS);
+		sweep_status_write(buf);
+		servo_sweep_begin_leg(sv, trip_tgt, now_ms);
 		break;
-	case SERVO_BOOT_GO:
-		servo_run_edge_sweep(sv, cam, tr);
+	case SWEEP_LEG_TRIP:
+		sv->sweep_trip++;
+		if (sv->sweep_trip >= SERVO_SWEEP_TRIPS) {
+			sv->sweep_leg = SWEEP_LEG_CENTER;
+			sweep_status_write("center");
+			servo_sweep_begin_leg(sv, SERVO_DUTY_CENTER_NS, now_ms);
+			break;
+		}
+		trip_tgt = (sv->sweep_trip % 2u == 0u) ? SERVO_DUTY_MAX_NS
+						       : SERVO_DUTY_MIN_NS;
+		snprintf(buf, sizeof(buf), "sweep %u/%u",
+			 sv->sweep_trip + 1u, SERVO_SWEEP_TRIPS);
+		sweep_status_write(buf);
+		servo_sweep_begin_leg(sv, trip_tgt, now_ms);
 		break;
-	case SERVO_BOOT_DONE:
+	case SWEEP_LEG_CENTER:
+		sv->boot = SERVO_BOOT_DONE;
+		sweep_status_write("idle");
+		fprintf(stderr, "info-panel-track: boot sweep done → track\n");
+		break;
 	default:
+		sv->boot = SERVO_BOOT_DONE;
+		sweep_status_write("idle");
 		break;
 	}
 }
@@ -772,18 +812,23 @@ static void servo_boot_tick(struct servo_state *sv, struct cam_state *cam,
 /*
  * Servo only in LOCK: one wide slew that aims to put the blob on the
  * optical center, then drop the pixel target into EGO_BLIND (old box is
- * invalid once the camera has moved).
+ * invalid once the camera has moved). Skipped while a test sweep runs.
  */
-static void servo_follow_track(struct servo_state *sv, struct cam_state *cam,
-			       struct track_state_data *tr)
+static void servo_follow_track(struct servo_state *sv, struct app *app)
 {
+	struct cam_state *cam;
+	struct track_state_data *tr;
 	float err;
 	float frac;
 	long step;
+	long target;
 
-	if (!servo_boot_ready(sv))
+	if (!app)
 		return;
-	if (!sv->enabled || !sv->ready)
+	cam = &app->cam;
+	tr = &app->track;
+
+	if (!servo_follow_allowed(sv))
 		return;
 	if (tr->state != TRACK_LOCK || !tr->have_target || cam->rgb_w < 2)
 		return;
@@ -792,28 +837,27 @@ static void servo_follow_track(struct servo_state *sv, struct cam_state *cam,
 	if (fabsf(err) < TRACK_SERVO_DEADZONE_FRAC * (float)cam->rgb_w)
 		return;
 
-	/* err/width ∈ (-0.5..+0.5] typically → scale to frame-width duty. */
 	frac = err / (float)cam->rgb_w;
 	step = (long)lroundf((float)sv->pan_sign * frac *
 			     (float)SERVO_NS_PER_FRAME_WIDTH);
 	if (step == 0)
 		return;
-	{
-		long target = sv->duty_ns + step;
 
-		if (target < SERVO_DUTY_MIN_NS)
-			target = SERVO_DUTY_MIN_NS;
-		else if (target > SERVO_DUTY_MAX_NS)
-			target = SERVO_DUTY_MAX_NS;
-		if (target == sv->duty_ns)
-			return;
-		servo_ramp_smooth(sv, cam, target);
-		tr->have_target = false;
-		tr->acquire_hits = 0;
-		tr->miss_frames = 0;
-		tr->state = TRACK_EGO_BLIND;
-		tr->ego_frames = TRACK_EGO_FRAMES;
-	}
+	target = sv->duty_ns + step;
+	if (target < SERVO_DUTY_MIN_NS)
+		target = SERVO_DUTY_MIN_NS;
+	else if (target > SERVO_DUTY_MAX_NS)
+		target = SERVO_DUTY_MAX_NS;
+	if (target == sv->duty_ns)
+		return;
+	if (!servo_set_duty(sv, target))
+		return;
+
+	tr->have_target = false;
+	tr->acquire_hits = 0;
+	tr->miss_frames = 0;
+	tr->state = TRACK_EGO_BLIND;
+	tr->ego_frames = TRACK_EGO_FRAMES;
 }
 
 /* ---- Motion evidence + track FSM ---------------------------------------- */
@@ -1660,27 +1704,6 @@ static void cam_note_disconnect(struct cam_state *cam, const char *why)
 	cam->next_retry_ms = monotonic_ms() + cam->retry_ms;
 }
 
-static void cam_drain(struct cam_state *cam)
-{
-	struct v4l2_buffer buf;
-
-	if (!cam || cam->fd < 0 || !cam->streaming)
-		return;
-
-	for (;;) {
-		memset(&buf, 0, sizeof(buf));
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_MMAP;
-		if (xioctl(cam->fd, VIDIOC_DQBUF, &buf) < 0) {
-			if (errno == EAGAIN)
-				break;
-			return;
-		}
-		if (buf.index < cam->nbufs)
-			(void)xioctl(cam->fd, VIDIOC_QBUF, &buf);
-	}
-}
-
 static void cam_grab(struct cam_state *cam, struct track_state_data *tr,
 		     bool track_enable)
 {
@@ -1832,12 +1855,13 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 				   (uint32_t *)b->data, b->width, b->height, STATUS_H,
 				   &lb);
 
-		/* Track bbox only after boot sweep, with a real target. */
-	if (servo_boot_ready(&app->servo) && app->track.have_target &&
+		/* Track bbox with a real target (also during test pan sweep). */
+	if (app->track.have_target &&
 	    lb.vw > 0 && lb.vh > 0 &&
 	    app->cam.rgb_w > 0 && app->cam.rgb_h > 0 &&
 	    (app->track.state == TRACK_LOCK || app->track.state == TRACK_COAST ||
-	     app->track.state == TRACK_ACQUIRE)) {
+	     app->track.state == TRACK_ACQUIRE ||
+	     app->track.state == TRACK_EGO_BLIND)) {
 		double sx = (double)lb.vw / (double)app->cam.rgb_w;
 		double sy = (double)lb.vh / (double)app->cam.rgb_h;
 		float hw = app->track.half_w > 4.f ? app->track.half_w : 4.f;
@@ -1851,6 +1875,8 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 			cairo_set_source_rgb(cr, 1.0, 0.92, 0.1);
 		else if (app->track.state == TRACK_ACQUIRE)
 			cairo_set_source_rgb(cr, 0.85, 0.85, 0.90);
+		else if (app->track.state == TRACK_EGO_BLIND)
+			cairo_set_source_rgb(cr, 0.55, 0.55, 0.60);
 		else
 			cairo_set_source_rgb(cr, 0.70, 0.65, 0.20);
 		cairo_set_line_width(cr, 3.0);
@@ -1872,45 +1898,32 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	cairo_set_source_rgb(cr, 0.85, 0.90, 0.95);
 	{
 		char st[48];
+		const char *sweep_tag = "";
 
-		if (!servo_boot_ready(&app->servo)) {
-			switch (app->servo.boot) {
-			case SERVO_BOOT_WAIT_VIDEO:
-				snprintf(st, sizeof(st), "boot wait");
-				break;
-			case SERVO_BOOT_GO:
-				snprintf(st, sizeof(st), "boot sweep");
-				break;
-			default:
-				snprintf(st, sizeof(st), "boot");
-				break;
-			}
-		} else {
-			switch (app->track.state) {
-			case TRACK_ACQUIRE:
-				snprintf(st, sizeof(st), "acquire %u/%u",
-					 app->track.acquire_hits, TRACK_ACQUIRE_NEED);
-				break;
-			case TRACK_COAST:
-				snprintf(st, sizeof(st), "coast %u", app->track.miss_frames);
-				break;
-			case TRACK_EGO_BLIND:
-				snprintf(st, sizeof(st), "ego %u", app->track.ego_frames);
-				break;
-			default:
-				snprintf(st, sizeof(st), "%s",
-					 track_state_name(app->track.state));
-				break;
-			}
+		switch (app->track.state) {
+		case TRACK_ACQUIRE:
+			snprintf(st, sizeof(st), "acquire %u/%u",
+				 app->track.acquire_hits, TRACK_ACQUIRE_NEED);
+			break;
+		case TRACK_COAST:
+			snprintf(st, sizeof(st), "coast %u", app->track.miss_frames);
+			break;
+		case TRACK_EGO_BLIND:
+			snprintf(st, sizeof(st), "ego %u", app->track.ego_frames);
+			break;
+		default:
+			snprintf(st, sizeof(st), "%s",
+				 track_state_name(app->track.state));
+			break;
 		}
-		snprintf(line, sizeof(line), "Track  ·  %s  ·  %s%s%s%s",
-			 app->cam.status, st,
-			 (servo_boot_ready(&app->servo) && app->track.last_cand)
-				 ? "  ·  mot"
-				 : "",
-			 (servo_boot_ready(&app->servo) && app->track.last_hit)
-				 ? "+hit"
-				 : "",
+		if (servo_sweep_active(&app->servo))
+			sweep_tag = "  ·  sweep";
+		else if (app->servo.boot == SERVO_BOOT_WAIT_VIDEO)
+			sweep_tag = "  ·  sweep wait";
+		snprintf(line, sizeof(line), "Track  ·  %s  ·  %s%s%s%s%s",
+			 app->cam.status, st, sweep_tag,
+			 app->track.last_cand ? "  ·  mot" : "",
+			 app->track.last_hit ? "+hit" : "",
 			 app->servo.ready ? "  ·  servo" : "");
 	}
 	cairo_move_to(cr, 14, 24);
@@ -2181,7 +2194,7 @@ int main(int argc, char **argv)
 	cam_find_and_open(&app.cam);
 	app.cam.next_retry_ms = monotonic_ms() + CAM_RETRY_MS;
 	servo_init(&app.servo);
-	sweep_status_write(servo_boot_ready(&app.servo) ? "idle" : "wait");
+	sweep_status_write(servo_follow_allowed(&app.servo) ? "idle" : "wait");
 
 	while (app.running) {
 		uint64_t now_ms;
@@ -2207,6 +2220,9 @@ int main(int argc, char **argv)
 
 		if (!app.configured)
 			timeout = 20;
+		else if (servo_sweep_active(&app.servo) ||
+			 app.servo.boot == SERVO_BOOT_WAIT_VIDEO)
+			timeout = (int)(SERVO_SWEEP_SLICE_US / 1000u);
 		else if (now_ms >= last_frame_ms + FRAME_MS)
 			timeout = POLL_MIN_MS;
 		else
@@ -2234,35 +2250,33 @@ int main(int argc, char **argv)
 		if (sweep_requested) {
 			sweep_requested = 0;
 			if (app.servo.enabled && app.servo.ready) {
-				track_reset(&app.track);
-				app.cam.motion_have_prev = false;
-				if (app.cam.have_frame && app.configured)
-					app.servo.boot = SERVO_BOOT_GO;
-				else
-					app.servo.boot = SERVO_BOOT_WAIT_VIDEO;
-				sweep_status_write("running");
 				fprintf(stderr,
 					"info-panel-track: SIGUSR2 → pan sweep %u×\n",
 					SERVO_SWEEP_TRIPS);
+				if (app.cam.have_frame && app.configured)
+					servo_sweep_start(&app.servo, now_ms);
+				else {
+					app.servo.boot = SERVO_BOOT_WAIT_VIDEO;
+					sweep_status_write("wait");
+				}
 			} else {
 				fprintf(stderr,
 					"info-panel-track: SIGUSR2 ignored (no servo)\n");
 			}
 		}
 
-		if (!servo_boot_ready(&app.servo)) {
-			servo_boot_tick(&app.servo, &app.cam, &app.track,
+		if (servo_sweep_active(&app.servo) ||
+		    app.servo.boot == SERVO_BOOT_WAIT_VIDEO) {
+			servo_boot_tick(&app.servo,
 					app.cam.have_frame && app.configured,
 					now_ms);
-			app.frame_dirty = true;
 		}
 
 		if (app.cam.fd >= 0 && grab_due) {
-			bool track_on = servo_boot_ready(&app.servo);
-
-			cam_grab(&app.cam, &app.track, track_on);
-			if (track_on)
-				servo_follow_track(&app.servo, &app.cam, &app.track);
+			/* Always detect/draw; only follow-pan pauses during sweep. */
+			cam_grab(&app.cam, &app.track, true);
+			if (servo_follow_allowed(&app.servo))
+				servo_follow_track(&app.servo, &app);
 		} else if (app.cam.fd < 0 && now_ms >= app.cam.next_retry_ms) {
 			bool ok = cam_find_and_open(&app.cam);
 
