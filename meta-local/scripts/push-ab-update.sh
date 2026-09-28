@@ -80,24 +80,37 @@ ssh_try 'command -v ab-update >/dev/null' \
 BEFORE=$(active_slot)
 log "==> Active slot before update: $BEFORE"
 
-log "==> WiFi on target:"
-ssh_try 'IFACE=wlan0
-if [ ! -d /sys/class/net/$IFACE ]; then
-	echo "  iface=$IFACE: absent"
-	exit 0
-fi
-oper=$(cat /sys/class/net/$IFACE/operstate 2>/dev/null || echo unknown)
-if command -v wpa_cli >/dev/null 2>&1; then
-	ssid=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^ssid=//p" | tr -d "\r")
-	freq=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^freq=//p" | tr -d "\r")
-	state=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^wpa_state=//p" | tr -d "\r")
-	ip=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^ip_address=//p" | tr -d "\r")
-	rssi=$(wpa_cli -i "$IFACE" signal_poll 2>/dev/null | sed -n "s/^RSSI=//p" | tr -d "\r" | head -n1)
-	echo "  iface=$IFACE operstate=$oper wpa_state=${state:-?} ssid=${ssid:-?} freq=${freq:-?} rssi=${rssi:-?} ip=${ip:-?}"
-else
+log "==> Network on target:"
+ssh_try '
+any=0
+for path in /sys/class/net/*; do
+	[ -e "$path" ] || continue
+	IFACE=$(basename "$path")
+	case "$IFACE" in
+	lo) continue ;;
+	esac
+	oper=$(cat "$path/operstate" 2>/dev/null || echo unknown)
+	[ "$oper" = up ] || continue
+	any=1
 	ip=$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk "{print \$4}" | head -n1)
-	echo "  iface=$IFACE operstate=$oper ip=${ip:-?} (wpa_cli not available)"
-fi'
+	if [ -d "$path/wireless" ] || [ -d "$path/phy80211" ]; then
+		if command -v wpa_cli >/dev/null 2>&1; then
+			ssid=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^ssid=//p" | tr -d "\r")
+			freq=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^freq=//p" | tr -d "\r")
+			state=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^wpa_state=//p" | tr -d "\r")
+			wip=$(wpa_cli -i "$IFACE" status 2>/dev/null | sed -n "s/^ip_address=//p" | tr -d "\r")
+			[ -n "$wip" ] && ip=$wip
+			rssi=$(wpa_cli -i "$IFACE" signal_poll 2>/dev/null | sed -n "s/^RSSI=//p" | tr -d "\r" | head -n1)
+			echo "  iface=$IFACE operstate=$oper wpa_state=${state:-?} ssid=${ssid:-?} freq=${freq:-?} rssi=${rssi:-?} ip=${ip:-?}"
+		else
+			echo "  iface=$IFACE operstate=$oper ip=${ip:-?} (wpa_cli not available)"
+		fi
+	else
+		echo "  iface=$IFACE operstate=$oper ip=${ip:-?}"
+	fi
+done
+[ "$any" = 1 ] || echo "  (no up interfaces)"
+'
 
 log "==> Uploading $(du -h "$BUNDLE" | cut -f1) to $TARGET:$REMOTE_DIR/"
 ssh_try "mkdir -p '$REMOTE_DIR'"
