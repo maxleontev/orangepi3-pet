@@ -3,14 +3,14 @@
 # ab-update, wait for reboot, and verify the new slot booted cleanly.
 #
 # Defaults match this project's root key and board address; override via env:
-#   TARGET=root@192.168.3.71  SSH_KEY=...  REMOTE_DIR=/data/update
+#   TARGET=root@192.168.3.73  SSH_KEY=...  REMOTE_DIR=/data/update
 #   SSH_WAIT_SEC=300
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
-TARGET="${TARGET:-root@192.168.3.71}"
+TARGET="${TARGET:-root@192.168.3.73}"
 SSH_KEY="${SSH_KEY:-$ROOT/meta-local/recipes-core/root-ssh-keys/files/id_ed25519}"
 REMOTE_DIR="${REMOTE_DIR:-/data/update}"
 BUNDLE_NAME="${BUNDLE_NAME:-khepri-ab-update.tar.gz}"

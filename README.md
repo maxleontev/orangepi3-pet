@@ -153,6 +153,25 @@ hdmi-screenshot /data/hdmi.png
 This is the compositor client buffer, not a photograph of the monitor.
 Host wrapper: [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot).
 
+<a id="servo-pan-sweep"></a>
+### On target: `servo-pan-sweep` (`/usr/sbin/servo-pan-sweep`)
+
+Ask the running `info-panel-track` to pan the camera edge↔edge three times,
+then park at center (same sequence as the boot sweep). Sends `SIGUSR2`;
+status is `/tmp/info-panel-track.sweep`.
+
+```bash
+servo-pan-sweep
+TIMEOUT_SEC=60 servo-pan-sweep
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TIMEOUT_SEC` | `45` | Fail if sweep does not reach `idle` |
+| `STATUS_PATH` | `/tmp/info-panel-track.sweep` | Panel sweep status file |
+
+Host wrapper: [`run-servo-pan-sweep.sh`](meta-local/scripts/README.md#run-servo-pan-sweep).
+
 <a id="ac200-mic-hdmi-play"></a>
 ### On target: `ac200-mic-hdmi-play` (`/usr/sbin/ac200-mic-hdmi-play`)
 

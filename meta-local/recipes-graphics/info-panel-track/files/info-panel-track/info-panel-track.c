@@ -2,7 +2,8 @@
  * Fullscreen Wayland panel: USB UVC preview + pan-servo track control.
  *
  * Selected when INFO_PANEL=track. Object-follow pipeline:
- *   block-energy motion → associate → track FSM → servo (only in LOCK).
+ *   boot sweep (edge↔edge ×3 → center) → block-energy motion → associate →
+ *   track FSM → one-shot servo center (only in LOCK) → ego-blind reseed.
  * The old info-panel-camera frame-diff→EMA→Kalman→PID path stays untouched.
  *
  * Capture: V4L2 MMAP. Prefer YUYV (hub-stable), else MJPEG (libjpeg-turbo).
@@ -13,6 +14,7 @@
  * flip with INFO_PANEL_SERVO_INVERT=1.
  *
  * SIGUSR1 → /tmp/info-panel-screenshot.png (same contract as other panels).
+ * SIGUSR2 → edge↔edge pan ×3 then center (same as boot; see servo-pan-sweep).
  */
 
 #define _GNU_SOURCE
@@ -51,14 +53,40 @@
 #define STATUS_H 36
 #define DECODE_FAIL_REOPEN 40
 
-/* Pan servo on pwmchip0/pwm0 (PD22). Period 20 ms; pulse 1.0–2.0 ms. */
+/* Pan servo on pwmchip0/pwm0 (PD22). Period 20 ms; pulse 0.5–2.5 ms
+ * covers typical hobby full travel (1.0–2.0 ms only reaches ~half on many).
+ *
+ * Default mount: lower pulse → CW (camera yaw right), higher → CCW.
+ * Software travel stops ~1/10 turn (~36°) short of the CCW rail so the
+ * horn does not hit the mechanical stop.
+ */
 #define SERVO_PWM_CHIP "/sys/class/pwm/pwmchip0"
 #define SERVO_PWM_PATH "/sys/class/pwm/pwmchip0/pwm0"
 #define SERVO_PERIOD_NS 20000000L
-#define SERVO_DUTY_MIN_NS 1000000L
-#define SERVO_DUTY_MAX_NS 2000000L
+#define SERVO_DUTY_RAIL_MIN_NS 500000L
+#define SERVO_DUTY_RAIL_MAX_NS 2500000L
+/* ~18° if 0.5–2.5 ms spans ~180° (half of the earlier 1/10-turn trim). */
+#define SERVO_CCW_MARGIN_NS 200000L
+#define SERVO_DUTY_MIN_NS SERVO_DUTY_RAIL_MIN_NS
+#define SERVO_DUTY_MAX_NS (SERVO_DUTY_RAIL_MAX_NS - SERVO_CCW_MARGIN_NS)
 #define SERVO_DUTY_CENTER_NS 1500000L
-#define SERVO_MAX_STEP_NS 80000L
+/*
+ * One-shot centering: duty change that slides the image by ~one frame
+ * width. Object at the left/right edge → about half of this step.
+ */
+#define SERVO_NS_PER_FRAME_WIDTH 520000L
+/* Boot: edge↔edge — blocking cosine ramp, one update per 20 ms PWM frame. */
+#define SERVO_SWEEP_TRIPS 3
+#define SERVO_SWEEP_ONEWAY_MS 5000
+/* Match hobby-servo frame (period 20 ms); faster writes just fight the HW. */
+#define SERVO_SWEEP_SLICE_US 20000
+#define SERVO_SWEEP_EDGE_HOLD_MS 80
+/* H6 PWM0 MMIO (avoid sun4i-pwm sysfs re-touching CTRL every duty write). */
+#define SERVO_PWM_PHYS 0x0300a000UL
+#define SERVO_PWM_MAP_LEN 0x400UL
+#define SERVO_PWM_REG_CTRL 0x0
+#define SERVO_PWM_REG_CH0_PRD 0x4
+#define SERVO_PWM_RDY0 (1u << 28)
 
 /* Motion evidence → candidate (camera pixel coords). No OpenCV. */
 #define MOTION_DIFF_THRESH 18
@@ -74,9 +102,12 @@
 /* Track FSM / association. */
 #define TRACK_ACQUIRE_NEED 3
 #define TRACK_COAST_FRAMES 5
-#define TRACK_EGO_FRAMES 3
+/* Blind after a one-shot pan (~1.2s at 10 fps) while the camera settles. */
+#define TRACK_EGO_FRAMES 12
 #define TRACK_EMA_ALPHA 0.45f
 #define TRACK_GATE_FRAC 0.28f
+/* Skip slew when already near center (~6% of width). */
+#define TRACK_SERVO_DEADZONE_FRAC 0.06f
 
 enum track_state {
 	TRACK_IDLE = 0,
@@ -162,6 +193,16 @@ struct servo_state {
 	bool ready;
 	int pan_sign; /* +1: object on right → increase duty */
 	long duty_ns;
+	int duty_fd; /* sysfs fallback when MMIO map fails */
+	volatile uint32_t *pwm_regs; /* /dev/mem map of 300a000.pwm */
+	uint32_t period_ticks; /* HW counter period (PRD+1) */
+	bool use_mmio;
+	/* Boot sweep before motion detect / follow. */
+	enum {
+		SERVO_BOOT_WAIT_VIDEO = 0,
+		SERVO_BOOT_GO,
+		SERVO_BOOT_DONE,
+	} boot;
 };
 
 struct app {
@@ -176,6 +217,8 @@ struct app {
 	struct wl_output *output;
 	int32_t output_width;
 	int32_t output_height;
+	int32_t mode_width; /* wl_output current mode (hint only) */
+	int32_t mode_height;
 	int32_t scale;
 	bool configured;
 	bool running;
@@ -190,6 +233,11 @@ struct app {
 };
 
 static volatile sig_atomic_t screenshot_requested;
+static volatile sig_atomic_t sweep_requested;
+
+#define SWEEP_STATUS_PATH "/tmp/info-panel-track.sweep"
+
+static void track_reset(struct track_state_data *tr);
 
 static const char *track_state_name(enum track_state s)
 {
@@ -289,6 +337,26 @@ static void on_sigusr1(int signo)
 	screenshot_requested = 1;
 }
 
+static void on_sigusr2(int signo)
+{
+	(void)signo;
+	sweep_requested = 1;
+}
+
+static void sweep_status_write(const char *text)
+{
+	int fd = open(SWEEP_STATUS_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+		      0644);
+	size_t n;
+
+	if (fd < 0)
+		return;
+	n = strlen(text);
+	if (write(fd, text, n) == (ssize_t)n)
+		(void)write(fd, "\n", 1);
+	close(fd);
+}
+
 static void shot_fail(const char *msg)
 {
 	FILE *f;
@@ -367,12 +435,77 @@ static int servo_write_ll(const char *path, long long v)
 	return servo_write_str(path, buf);
 }
 
+static void servo_unmap(struct servo_state *sv)
+{
+	if (sv->pwm_regs) {
+		munmap((void *)sv->pwm_regs, SERVO_PWM_MAP_LEN);
+		sv->pwm_regs = NULL;
+	}
+	sv->use_mmio = false;
+	sv->period_ticks = 0;
+}
+
 static void servo_close(struct servo_state *sv)
 {
+	if (sv->duty_fd >= 0) {
+		close(sv->duty_fd);
+		sv->duty_fd = -1;
+	}
+	servo_unmap(sv);
 	if (!sv->ready)
 		return;
 	servo_write_str(SERVO_PWM_PATH "/enable", "0");
 	sv->ready = false;
+}
+
+/*
+ * Map PWM registers so duty updates only touch CH0_PRD. The sun4i-pwm
+ * sysfs path rewrites CTRL on every apply; that can glitch the pulse and
+ * the hobby servo then ticks instead of gliding.
+ */
+static bool servo_map_mmio(struct servo_state *sv)
+{
+	int fd;
+	void *map;
+	uint32_t prd;
+
+	fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+	if (fd < 0) {
+		fprintf(stderr, "info-panel-track: /dev/mem open: %s\n",
+			strerror(errno));
+		return false;
+	}
+	map = mmap(NULL, SERVO_PWM_MAP_LEN, PROT_READ | PROT_WRITE, MAP_SHARED,
+		   fd, (off_t)SERVO_PWM_PHYS);
+	close(fd);
+	if (map == MAP_FAILED) {
+		fprintf(stderr, "info-panel-track: pwm mmap: %s\n",
+			strerror(errno));
+		return false;
+	}
+
+	sv->pwm_regs = (volatile uint32_t *)map;
+	prd = sv->pwm_regs[SERVO_PWM_REG_CH0_PRD / 4u];
+	sv->period_ticks = ((prd >> 16) & 0xffffu) + 1u;
+	if (sv->period_ticks < 2u) {
+		servo_unmap(sv);
+		return false;
+	}
+	sv->use_mmio = true;
+	return true;
+}
+
+static void servo_mmio_wait_rdy(struct servo_state *sv)
+{
+	unsigned i;
+
+	if (!sv->pwm_regs)
+		return;
+	for (i = 0; i < 40u; i++) {
+		if (!(sv->pwm_regs[SERVO_PWM_REG_CTRL / 4u] & SERVO_PWM_RDY0))
+			return;
+		usleep(500);
+	}
 }
 
 static bool servo_init(struct servo_state *sv)
@@ -383,9 +516,14 @@ static bool servo_init(struct servo_state *sv)
 	memset(sv, 0, sizeof(*sv));
 	sv->pan_sign = -1; /* camera-on-servo: object on right → decrease duty */
 	sv->duty_ns = SERVO_DUTY_CENTER_NS;
+	sv->duty_fd = -1;
+	sv->pwm_regs = NULL;
+	sv->period_ticks = 0;
+	sv->use_mmio = false;
 	if (env && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' ||
 		    env[0] == 'f' || env[0] == 'F')) {
 		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
 		return false;
 	}
 	sv->enabled = true;
@@ -398,6 +536,7 @@ static bool servo_init(struct servo_state *sv)
 			fprintf(stderr,
 				"info-panel-track: servo pwm0 missing (need root export)\n");
 			sv->enabled = false;
+			sv->boot = SERVO_BOOT_DONE;
 			return false;
 		}
 		usleep(50000);
@@ -407,74 +546,271 @@ static bool servo_init(struct servo_state *sv)
 	    servo_write_ll(SERVO_PWM_PATH "/duty_cycle", SERVO_DUTY_CENTER_NS) < 0) {
 		fprintf(stderr, "info-panel-track: servo pwm setup failed\n");
 		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
 		return false;
 	}
 	servo_write_str(SERVO_PWM_PATH "/polarity", "normal");
 	if (servo_write_str(SERVO_PWM_PATH "/enable", "1") < 0) {
 		fprintf(stderr, "info-panel-track: servo pwm enable failed\n");
 		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
 		return false;
 	}
 	sv->ready = true;
 	sv->duty_ns = SERVO_DUTY_CENTER_NS;
-	fprintf(stderr, "info-panel-track: servo pan on %s (sign=%d)\n",
-		SERVO_PWM_PATH, sv->pan_sign);
+	sv->duty_fd = open(SERVO_PWM_PATH "/duty_cycle", O_WRONLY | O_CLOEXEC);
+	if (sv->duty_fd < 0) {
+		fprintf(stderr, "info-panel-track: servo duty fd open failed\n");
+		servo_write_str(SERVO_PWM_PATH "/enable", "0");
+		sv->ready = false;
+		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
+		return false;
+	}
+	sv->boot = SERVO_BOOT_WAIT_VIDEO;
+	if (servo_map_mmio(sv)) {
+		fprintf(stderr,
+			"info-panel-track: servo pan on %s MMIO (sign=%d, ticks=%u)\n",
+			SERVO_PWM_PATH, sv->pan_sign, sv->period_ticks);
+	} else {
+		fprintf(stderr,
+			"info-panel-track: servo pan on %s sysfs (sign=%d)\n",
+			SERVO_PWM_PATH, sv->pan_sign);
+	}
 	return true;
 }
 
-/* Rate-limited duty step. Returns true if PWM actually changed. */
-static bool servo_nudge(struct servo_state *sv, long delta_ns)
+/* Apply a duty (clamped). Prefer MMIO CH0_PRD-only writes when mapped. */
+static bool servo_set_duty(struct servo_state *sv, long duty_ns)
+{
+	char buf[32];
+	int n;
+	long duty = duty_ns;
+
+	if (!sv->enabled || !sv->ready)
+		return false;
+	if (duty < SERVO_DUTY_MIN_NS)
+		duty = SERVO_DUTY_MIN_NS;
+	else if (duty > SERVO_DUTY_MAX_NS)
+		duty = SERVO_DUTY_MAX_NS;
+	if (duty == sv->duty_ns)
+		return true;
+
+	if (sv->use_mmio && sv->pwm_regs && sv->period_ticks > 1u) {
+		uint32_t dty = (uint32_t)(((uint64_t)duty * (uint64_t)sv->period_ticks) /
+					  (uint64_t)SERVO_PERIOD_NS);
+
+		if (dty > sv->period_ticks)
+			dty = sv->period_ticks;
+		servo_mmio_wait_rdy(sv);
+		sv->pwm_regs[SERVO_PWM_REG_CH0_PRD / 4u] =
+			(dty & 0xffffu) |
+			(((sv->period_ticks - 1u) & 0xffffu) << 16);
+		sv->duty_ns = duty;
+		return true;
+	}
+
+	if (sv->duty_fd < 0)
+		return false;
+	n = snprintf(buf, sizeof(buf), "%ld", duty);
+	if (n < 1)
+		return false;
+	if (lseek(sv->duty_fd, 0, SEEK_SET) < 0)
+		return false;
+	if (write(sv->duty_fd, buf, (size_t)n) != n)
+		return false;
+	sv->duty_ns = duty;
+	return true;
+}
+
+static bool servo_slew(struct servo_state *sv, long delta_ns)
 {
 	long duty;
-	long step = delta_ns;
 
-	if (!sv->enabled || !sv->ready || step == 0)
-		return false;
-	if (step > SERVO_MAX_STEP_NS)
-		step = SERVO_MAX_STEP_NS;
-	else if (step < -SERVO_MAX_STEP_NS)
-		step = -SERVO_MAX_STEP_NS;
-
-	if ((sv->duty_ns >= SERVO_DUTY_MAX_NS && step > 0) ||
-	    (sv->duty_ns <= SERVO_DUTY_MIN_NS && step < 0))
+	if (!sv->enabled || !sv->ready || delta_ns == 0)
 		return false;
 
-	duty = sv->duty_ns + step;
+	if ((sv->duty_ns >= SERVO_DUTY_MAX_NS && delta_ns > 0) ||
+	    (sv->duty_ns <= SERVO_DUTY_MIN_NS && delta_ns < 0))
+		return false;
+
+	duty = sv->duty_ns + delta_ns;
 	if (duty < SERVO_DUTY_MIN_NS)
 		duty = SERVO_DUTY_MIN_NS;
 	else if (duty > SERVO_DUTY_MAX_NS)
 		duty = SERVO_DUTY_MAX_NS;
 	if (duty == sv->duty_ns)
 		return false;
-	if (servo_write_ll(SERVO_PWM_PATH "/duty_cycle", duty) != 0)
-		return false;
-	sv->duty_ns = duty;
-	return true;
+	return servo_set_duty(sv, duty);
 }
 
 /*
- * Servo may move only while LOCK. Detection / association will feed
- * track.have_target + track.x; until then this is a no-op.
+ * Blocking cosine ramp: one duty write per servo PWM period (20 ms).
+ * Ease-in/out avoids bang starts; MMIO path avoids sun4i CTRL glitches.
+ * Drain UVC between slices so a multi-second ramp does not stall the cam.
+ */
+static void cam_drain(struct cam_state *cam);
+
+static void servo_ramp_smooth(struct servo_state *sv, struct cam_state *cam,
+			      long target)
+{
+	long from = sv->duty_ns;
+	long span = target - from;
+	long abs_span = span < 0 ? -span : span;
+	long full = SERVO_DUTY_MAX_NS - SERVO_DUTY_MIN_NS;
+	unsigned dur_ms;
+	unsigned nsteps;
+	unsigned i;
+	struct timespec next;
+
+	if (!sv->enabled || !sv->ready)
+		return;
+	if (abs_span < 1) {
+		(void)servo_set_duty(sv, target);
+		return;
+	}
+
+	dur_ms = (unsigned)SERVO_SWEEP_ONEWAY_MS;
+	if (full > 0 && abs_span < full) {
+		dur_ms = (unsigned)((unsigned long)SERVO_SWEEP_ONEWAY_MS *
+				   (unsigned long)abs_span / (unsigned long)full);
+		if (dur_ms < 500u)
+			dur_ms = 500u;
+	}
+
+	nsteps = (dur_ms * 1000u) / (unsigned)SERVO_SWEEP_SLICE_US;
+	if (nsteps < 1u)
+		nsteps = 1u;
+
+	clock_gettime(CLOCK_MONOTONIC, &next);
+	for (i = 1; i <= nsteps; i++) {
+		double t = (double)i / (double)nsteps;
+		double s = 0.5 - 0.5 * cos(M_PI * t);
+		long duty = from + (long)llround((double)span * s);
+
+		(void)servo_set_duty(sv, duty);
+		if (cam && (i % 5u) == 0u)
+			cam_drain(cam);
+		next.tv_nsec += (long)SERVO_SWEEP_SLICE_US * 1000L;
+		if (next.tv_nsec >= 1000000000L) {
+			next.tv_sec += 1;
+			next.tv_nsec -= 1000000000L;
+		}
+		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+	}
+	(void)servo_set_duty(sv, target);
+	if (cam)
+		cam_drain(cam);
+}
+
+static void servo_run_edge_sweep(struct servo_state *sv, struct cam_state *cam,
+				 struct track_state_data *tr)
+{
+	unsigned i;
+	char buf[32];
+
+	fprintf(stderr, "info-panel-track: boot sweep %u× edge-to-edge\n",
+		SERVO_SWEEP_TRIPS);
+	sweep_status_write("running");
+
+	sweep_status_write("home");
+	servo_ramp_smooth(sv, cam, SERVO_DUTY_MIN_NS);
+	usleep((useconds_t)SERVO_SWEEP_EDGE_HOLD_MS * 1000u);
+
+	for (i = 0; i < SERVO_SWEEP_TRIPS; i++) {
+		long tgt = (i % 2u == 0u) ? SERVO_DUTY_MAX_NS : SERVO_DUTY_MIN_NS;
+
+		snprintf(buf, sizeof(buf), "sweep %u/%u", i + 1u, SERVO_SWEEP_TRIPS);
+		sweep_status_write(buf);
+		servo_ramp_smooth(sv, cam, tgt);
+		usleep((useconds_t)SERVO_SWEEP_EDGE_HOLD_MS * 1000u);
+	}
+
+	sweep_status_write("center");
+	servo_ramp_smooth(sv, cam, SERVO_DUTY_CENTER_NS);
+
+	cam->motion_have_prev = false;
+	track_reset(tr);
+	sv->boot = SERVO_BOOT_DONE;
+	sweep_status_write("idle");
+	fprintf(stderr, "info-panel-track: boot sweep done → track\n");
+}
+
+static bool servo_boot_ready(const struct servo_state *sv)
+{
+	return !sv->enabled || sv->boot == SERVO_BOOT_DONE;
+}
+
+static void servo_boot_tick(struct servo_state *sv, struct cam_state *cam,
+			    struct track_state_data *tr, bool have_video,
+			    uint64_t now_ms)
+{
+	(void)now_ms;
+
+	if (!sv->enabled || !sv->ready) {
+		sv->boot = SERVO_BOOT_DONE;
+		return;
+	}
+	if (sv->boot == SERVO_BOOT_DONE)
+		return;
+
+	switch (sv->boot) {
+	case SERVO_BOOT_WAIT_VIDEO:
+		if (!have_video)
+			return;
+		servo_run_edge_sweep(sv, cam, tr);
+		break;
+	case SERVO_BOOT_GO:
+		servo_run_edge_sweep(sv, cam, tr);
+		break;
+	case SERVO_BOOT_DONE:
+	default:
+		break;
+	}
+}
+
+/*
+ * Servo only in LOCK: one wide slew that aims to put the blob on the
+ * optical center, then drop the pixel target into EGO_BLIND (old box is
+ * invalid once the camera has moved).
  */
 static void servo_follow_track(struct servo_state *sv, struct cam_state *cam,
 			       struct track_state_data *tr)
 {
 	float err;
+	float frac;
 	long step;
 
+	if (!servo_boot_ready(sv))
+		return;
 	if (!sv->enabled || !sv->ready)
 		return;
 	if (tr->state != TRACK_LOCK || !tr->have_target || cam->rgb_w < 2)
 		return;
 
 	err = tr->x - 0.5f * (float)cam->rgb_w;
-	/* Deadzone ~4% of width until a real detector lands. */
-	if (fabsf(err) < 0.04f * (float)cam->rgb_w)
+	if (fabsf(err) < TRACK_SERVO_DEADZONE_FRAC * (float)cam->rgb_w)
 		return;
 
-	/* Proportional nudge; gain tuned later with real measurements. */
-	step = (long)lroundf((float)sv->pan_sign * err * 400.f);
-	if (servo_nudge(sv, step)) {
+	/* err/width ∈ (-0.5..+0.5] typically → scale to frame-width duty. */
+	frac = err / (float)cam->rgb_w;
+	step = (long)lroundf((float)sv->pan_sign * frac *
+			     (float)SERVO_NS_PER_FRAME_WIDTH);
+	if (step == 0)
+		return;
+	{
+		long target = sv->duty_ns + step;
+
+		if (target < SERVO_DUTY_MIN_NS)
+			target = SERVO_DUTY_MIN_NS;
+		else if (target > SERVO_DUTY_MAX_NS)
+			target = SERVO_DUTY_MAX_NS;
+		if (target == sv->duty_ns)
+			return;
+		servo_ramp_smooth(sv, cam, target);
+		tr->have_target = false;
+		tr->acquire_hits = 0;
+		tr->miss_frames = 0;
 		tr->state = TRACK_EGO_BLIND;
 		tr->ego_frames = TRACK_EGO_FRAMES;
 	}
@@ -859,8 +1195,12 @@ static void track_on_frame(struct track_state_data *tr, struct cam_state *cam)
 		(void)motion_detect_candidate(cam, true);
 		if (tr->ego_frames > 0)
 			tr->ego_frames--;
-		if (tr->ego_frames == 0)
-			tr->state = tr->have_target ? TRACK_LOCK : TRACK_IDLE;
+		if (tr->ego_frames == 0) {
+			/* Never resume LOCK on a pre-pan pixel estimate. */
+			tr->have_target = false;
+			tr->acquire_hits = 0;
+			tr->state = TRACK_IDLE;
+		}
 		return;
 	}
 
@@ -1320,7 +1660,29 @@ static void cam_note_disconnect(struct cam_state *cam, const char *why)
 	cam->next_retry_ms = monotonic_ms() + cam->retry_ms;
 }
 
-static void cam_grab(struct cam_state *cam, struct track_state_data *tr)
+static void cam_drain(struct cam_state *cam)
+{
+	struct v4l2_buffer buf;
+
+	if (!cam || cam->fd < 0 || !cam->streaming)
+		return;
+
+	for (;;) {
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		if (xioctl(cam->fd, VIDIOC_DQBUF, &buf) < 0) {
+			if (errno == EAGAIN)
+				break;
+			return;
+		}
+		if (buf.index < cam->nbufs)
+			(void)xioctl(cam->fd, VIDIOC_QBUF, &buf);
+	}
+}
+
+static void cam_grab(struct cam_state *cam, struct track_state_data *tr,
+		     bool track_enable)
 {
 	struct v4l2_buffer buf;
 	struct v4l2_buffer latest;
@@ -1367,7 +1729,14 @@ static void cam_grab(struct cam_state *cam, struct track_state_data *tr)
 			ok = decode_yuyv(cam, p, len);
 		if (ok) {
 			cam->decode_fails = 0;
-			track_on_frame(tr, cam);
+			if (track_enable)
+				track_on_frame(tr, cam);
+			else {
+				/* Keep gray baseline warm without arming detect. */
+				(void)motion_detect_candidate(cam, true);
+				tr->last_cand = false;
+				tr->last_hit = false;
+			}
 			snprintf(cam->status, sizeof(cam->status), "%s %ux%u %s",
 				 cam->device, cam->width, cam->height,
 				 cam->fmt == CAM_FMT_MJPEG ? "MJPEG" : "YUYV");
@@ -1463,11 +1832,12 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 				   (uint32_t *)b->data, b->width, b->height, STATUS_H,
 				   &lb);
 
-	/* Track bbox with a real target (acquire / lock / coast / brief ego). */
-	if (app->track.have_target && lb.vw > 0 && lb.vh > 0 &&
+		/* Track bbox only after boot sweep, with a real target. */
+	if (servo_boot_ready(&app->servo) && app->track.have_target &&
+	    lb.vw > 0 && lb.vh > 0 &&
 	    app->cam.rgb_w > 0 && app->cam.rgb_h > 0 &&
 	    (app->track.state == TRACK_LOCK || app->track.state == TRACK_COAST ||
-	     app->track.state == TRACK_ACQUIRE || app->track.state == TRACK_EGO_BLIND)) {
+	     app->track.state == TRACK_ACQUIRE)) {
 		double sx = (double)lb.vw / (double)app->cam.rgb_w;
 		double sy = (double)lb.vh / (double)app->cam.rgb_h;
 		float hw = app->track.half_w > 4.f ? app->track.half_w : 4.f;
@@ -1503,25 +1873,44 @@ static void draw_panel(struct app *app, struct shm_buffer *b)
 	{
 		char st[48];
 
-		switch (app->track.state) {
-		case TRACK_ACQUIRE:
-			snprintf(st, sizeof(st), "acquire %u/%u",
-				 app->track.acquire_hits, TRACK_ACQUIRE_NEED);
-			break;
-		case TRACK_COAST:
-			snprintf(st, sizeof(st), "coast %u", app->track.miss_frames);
-			break;
-		case TRACK_EGO_BLIND:
-			snprintf(st, sizeof(st), "ego %u", app->track.ego_frames);
-			break;
-		default:
-			snprintf(st, sizeof(st), "%s", track_state_name(app->track.state));
-			break;
+		if (!servo_boot_ready(&app->servo)) {
+			switch (app->servo.boot) {
+			case SERVO_BOOT_WAIT_VIDEO:
+				snprintf(st, sizeof(st), "boot wait");
+				break;
+			case SERVO_BOOT_GO:
+				snprintf(st, sizeof(st), "boot sweep");
+				break;
+			default:
+				snprintf(st, sizeof(st), "boot");
+				break;
+			}
+		} else {
+			switch (app->track.state) {
+			case TRACK_ACQUIRE:
+				snprintf(st, sizeof(st), "acquire %u/%u",
+					 app->track.acquire_hits, TRACK_ACQUIRE_NEED);
+				break;
+			case TRACK_COAST:
+				snprintf(st, sizeof(st), "coast %u", app->track.miss_frames);
+				break;
+			case TRACK_EGO_BLIND:
+				snprintf(st, sizeof(st), "ego %u", app->track.ego_frames);
+				break;
+			default:
+				snprintf(st, sizeof(st), "%s",
+					 track_state_name(app->track.state));
+				break;
+			}
 		}
 		snprintf(line, sizeof(line), "Track  ·  %s  ·  %s%s%s%s",
 			 app->cam.status, st,
-			 app->track.last_cand ? "  ·  mot" : "",
-			 app->track.last_hit ? "+hit" : "",
+			 (servo_boot_ready(&app->servo) && app->track.last_cand)
+				 ? "  ·  mot"
+				 : "",
+			 (servo_boot_ready(&app->servo) && app->track.last_hit)
+				 ? "+hit"
+				 : "",
 			 app->servo.ready ? "  ·  servo" : "");
 	}
 	cairo_move_to(cr, 14, 24);
@@ -1556,8 +1945,14 @@ static struct shm_buffer *pick_buffer(struct app *app)
 
 static bool render(struct app *app)
 {
-	int width = app->output_width > 0 ? app->output_width : 1280;
-	int height = app->output_height > 0 ? app->output_height : 720;
+	int width = app->output_width;
+	int height = app->output_height;
+
+	/* Only paint after xdg_toplevel gave a real size. Using wl_output's
+	 * 2560×1440 against a first fullscreen configure of 0×0 is xdg error 4
+	 * and kills the Wayland connection (black HDMI, stuck panel). */
+	if (width < 1 || height < 1)
+		return false;
 
 	for (int i = 0; i < 2; i++) {
 		if (app->buffers[i].wl_buffer &&
@@ -1578,7 +1973,8 @@ static bool render(struct app *app)
 
 	draw_panel(app, b);
 	b->busy = true;
-	wl_surface_set_buffer_scale(app->surface, app->scale > 0 ? app->scale : 1);
+	/* Fullscreen DRM kiosk: keep scale 1 so buffer size == surface size. */
+	wl_surface_set_buffer_scale(app->surface, 1);
 	wl_surface_attach(app->surface, b->wl_buffer, 0, 0);
 	wl_surface_damage_buffer(app->surface, 0, 0, width, height);
 	wl_surface_commit(app->surface);
@@ -1604,6 +2000,12 @@ static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, u
 	struct app *app = data;
 
 	xdg_surface_ack_configure(xdg_surface, serial);
+	/* Weston may send fullscreen configure 0×0 first; wait for a real size.
+	 * Re-commit without a buffer so the compositor sends a sized configure. */
+	if (app->output_width < 1 || app->output_height < 1) {
+		wl_surface_commit(app->surface);
+		return;
+	}
 	app->configured = true;
 	render(app);
 }
@@ -1619,10 +2021,12 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *toplevel,
 
 	(void)toplevel;
 	(void)states;
-	if (width > 0)
+	/* Ignore 0×0: that is "compositor has not sized us yet". Painting a
+	 * wl_output mode buffer against fullscreen(0×0) is xdg error 4. */
+	if (width > 0 && height > 0) {
 		app->output_width = width;
-	if (height > 0)
 		app->output_height = height;
+	}
 }
 
 static void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel)
@@ -1663,8 +2067,8 @@ static void output_mode(void *data, struct wl_output *output, uint32_t flags,
 	(void)output;
 	(void)refresh;
 	if (flags & WL_OUTPUT_MODE_CURRENT) {
-		app->output_width = width;
-		app->output_height = height;
+		app->mode_width = width;
+		app->mode_height = height;
 	}
 }
 
@@ -1732,8 +2136,10 @@ int main(int argc, char **argv)
 
 	app.running = true;
 	app.scale = 1;
-	app.output_width = 1280;
-	app.output_height = 720;
+	app.output_width = 0;
+	app.output_height = 0;
+	app.mode_width = 0;
+	app.mode_height = 0;
 	app.cam.fd = -1;
 	app.cam.retry_ms = CAM_RETRY_MS;
 	track_reset(&app.track);
@@ -1769,10 +2175,13 @@ int main(int argc, char **argv)
 	sa.sa_handler = on_sigusr1;
 	sigemptyset(&sa.sa_mask);
 	sigaction(SIGUSR1, &sa, NULL);
+	sa.sa_handler = on_sigusr2;
+	sigaction(SIGUSR2, &sa, NULL);
 
 	cam_find_and_open(&app.cam);
 	app.cam.next_retry_ms = monotonic_ms() + CAM_RETRY_MS;
 	servo_init(&app.servo);
+	sweep_status_write(servo_boot_ready(&app.servo) ? "idle" : "wait");
 
 	while (app.running) {
 		uint64_t now_ms;
@@ -1822,9 +2231,38 @@ int main(int argc, char **argv)
 		now_ms = monotonic_ms();
 		grab_due = app.configured && (now_ms - last_frame_ms) >= FRAME_MS;
 
+		if (sweep_requested) {
+			sweep_requested = 0;
+			if (app.servo.enabled && app.servo.ready) {
+				track_reset(&app.track);
+				app.cam.motion_have_prev = false;
+				if (app.cam.have_frame && app.configured)
+					app.servo.boot = SERVO_BOOT_GO;
+				else
+					app.servo.boot = SERVO_BOOT_WAIT_VIDEO;
+				sweep_status_write("running");
+				fprintf(stderr,
+					"info-panel-track: SIGUSR2 → pan sweep %u×\n",
+					SERVO_SWEEP_TRIPS);
+			} else {
+				fprintf(stderr,
+					"info-panel-track: SIGUSR2 ignored (no servo)\n");
+			}
+		}
+
+		if (!servo_boot_ready(&app.servo)) {
+			servo_boot_tick(&app.servo, &app.cam, &app.track,
+					app.cam.have_frame && app.configured,
+					now_ms);
+			app.frame_dirty = true;
+		}
+
 		if (app.cam.fd >= 0 && grab_due) {
-			cam_grab(&app.cam, &app.track);
-			servo_follow_track(&app.servo, &app.cam, &app.track);
+			bool track_on = servo_boot_ready(&app.servo);
+
+			cam_grab(&app.cam, &app.track, track_on);
+			if (track_on)
+				servo_follow_track(&app.servo, &app.cam, &app.track);
 		} else if (app.cam.fd < 0 && now_ms >= app.cam.next_retry_ms) {
 			bool ok = cam_find_and_open(&app.cam);
 

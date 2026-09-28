@@ -75,10 +75,9 @@ Fullscreen **info-panel-track**: UVC preview plus redesigned pan-servo follow
 - Same V4L2 / letterbox / SIGUSR1 screenshot contract as the camera panel
 - Block-energy frame-diff → associate → FSM (`idle` / `acquire` / `lock` / `coast` / …)
 - Bbox: white while acquiring, yellow when locked, dim yellow while coasting
-- Servo pan is **off by default** in the unit (`INFO_PANEL_SERVO=0`) while
-  tuning motion/bbox; set `INFO_PANEL_SERVO=1` to re-enable PWM0 pan
+- Servo pan on HW PWM0 while locked (`INFO_PANEL_SERVO=1`; set `0` to disable)
 - Status bar: FSM state (`acquire 2/3`, `lock`, `coast N`, …), `mot`/`+hit`
-  when the detector saw / accepted a blob this frame
+  when the detector saw / accepted a blob this frame; `servo` when PWM is ready
 - Capture target ~10 fps (`FRAME_MS=100`); UI still respects busy wl_shm buffers
 
 ---
@@ -227,8 +226,14 @@ Meson + Wayland client (`info-panel-track.c`) + `info-panel-track.service`.
 - Installed when `INFO_PANEL = "track"` in `local.conf`.
 - UVC preview + pan-servo: block-energy motion → soft connected blob → FSM
   (idle/acquire/lock/coast/ego/lost). Bbox covers the blob, not only the peak edge.
-- White bbox while acquiring; yellow when locked; servo only in lock
-  (`INFO_PANEL_SERVO=0` while tuning motion).
+- White bbox while acquiring; yellow when locked; servo only in lock:
+  one wide slew to put the blob on frame center, then ego-blind clears
+  the target so the old box is not chased.
+- On start (after the first camera frame on HDMI): full edge↔edge pan ×3,
+  then park at center; motion detect / follow start only after that.
+  Runtime: `/usr/sbin/servo-pan-sweep` or host
+  [`run-servo-pan-sweep.sh`](../../scripts/README.md#run-servo-pan-sweep)
+  (`SIGUSR2`).
 - Same UVC udev/modprobe snippets and PWM0 export as the camera service.
 - Installs shared `/usr/sbin/hdmi-screenshot`.
 

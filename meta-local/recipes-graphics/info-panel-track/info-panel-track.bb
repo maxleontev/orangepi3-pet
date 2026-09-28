@@ -13,6 +13,7 @@ SRC_URI = " \
     file://info-panel-track \
     file://info-panel-track.service \
     file://hdmi-screenshot.sh \
+    file://servo-pan-sweep.sh \
     file://99-uvc-video.rules \
     file://usb-autosuspend.conf \
     file://uvcvideo.conf \
@@ -34,6 +35,7 @@ do_install:append() {
     install -m 0644 ${WORKDIR}/info-panel-track.service ${D}${systemd_system_unitdir}/
     install -d ${D}${sbindir}
     install -m 0755 ${WORKDIR}/hdmi-screenshot.sh ${D}${sbindir}/hdmi-screenshot
+    install -m 0755 ${WORKDIR}/servo-pan-sweep.sh ${D}${sbindir}/servo-pan-sweep
     install -d ${D}${sysconfdir}/udev/rules.d
     install -m 0644 ${WORKDIR}/99-uvc-video.rules ${D}${sysconfdir}/udev/rules.d/
     install -d ${D}${sysconfdir}/modprobe.d
@@ -44,6 +46,7 @@ do_install:append() {
 FILES:${PN} += " \
     ${systemd_system_unitdir}/info-panel-track.service \
     ${sbindir}/hdmi-screenshot \
+    ${sbindir}/servo-pan-sweep \
     ${sysconfdir}/udev/rules.d/99-uvc-video.rules \
     ${sysconfdir}/modprobe.d/usb-autosuspend.conf \
     ${sysconfdir}/modprobe.d/uvcvideo.conf \

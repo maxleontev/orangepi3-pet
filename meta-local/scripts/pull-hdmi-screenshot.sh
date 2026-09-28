@@ -5,14 +5,14 @@
 # the PNG locally. If the destination already exists, picks the next free name
 # with a 4-digit suffix (hdmi.png → hdmi-0001.png → hdmi-0002.png …).
 # Defaults match push-ab-update.sh:
-#   TARGET=root@192.168.3.71  SSH_KEY=...  SSH_BIND=192.168.3.6
+#   TARGET=root@192.168.3.73  SSH_KEY=...  SSH_BIND=192.168.3.6
 #   OUT=hdmi.png  TIMEOUT_SEC=8
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
-TARGET="${TARGET:-root@192.168.3.71}"
+TARGET="${TARGET:-root@192.168.3.73}"
 SSH_KEY="${SSH_KEY:-$ROOT/meta-local/recipes-core/root-ssh-keys/files/id_ed25519}"
 OUT="${OUT:-${1:-$PWD/hdmi.png}}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-8}"
@@ -76,7 +76,7 @@ Usage: pull-hdmi-screenshot.sh [OUT.png]
             (hdmi.png, hdmi-0001.png, hdmi-0002.png, …).
 
 Environment:
-  TARGET=root@192.168.3.71
+  TARGET=root@192.168.3.73
   SSH_KEY=meta-local/recipes-core/root-ssh-keys/files/id_ed25519
   SSH_BIND=192.168.3.6          # dual-NIC: bind to ethernet or wifi address
   TIMEOUT_SEC=8                 # wait for info-panel on the board
