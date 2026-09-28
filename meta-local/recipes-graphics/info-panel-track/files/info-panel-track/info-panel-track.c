@@ -1,0 +1,2331 @@
+/*
+ * Fullscreen Wayland panel: USB UVC preview + pan-servo track control.
+ *
+ * Selected when INFO_PANEL=track. Object-follow pipeline:
+ *   boot sweep (edge↔edge ×3 → center) → block-energy motion → associate →
+ *   track FSM → one-shot servo center (only in LOCK) → ego-blind reseed.
+ * The old info-panel-camera frame-diff→EMA→Kalman→PID path stays untouched.
+ *
+ * Capture: V4L2 MMAP. Prefer YUYV (hub-stable), else MJPEG (libjpeg-turbo).
+ * Device: INFO_PANEL_CAMERA_DEVICE, else first /dev/video* with CAPTURE.
+ * Size: INFO_PANEL_CAMERA_SIZE=WxH (service default 320x240).
+ *
+ * Servo pan: HW PWM0 on PD22 (CON12 pin 7). Disable with INFO_PANEL_SERVO=0;
+ * flip with INFO_PANEL_SERVO_INVERT=1.
+ *
+ * SIGUSR1 → /tmp/info-panel-screenshot.png (same contract as other panels).
+ * SIGUSR2 → edge↔edge pan ×3 then center (same as boot; see servo-pan-sweep).
+ */
+
+#define _GNU_SOURCE
+#include <cairo/cairo.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <poll.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <jpeglib.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <wayland-client.h>
+#include "xdg-shell-client-protocol.h"
+
+#define SHOT_PNG "/tmp/info-panel-screenshot.png"
+#define SHOT_TMP "/tmp/info-panel-screenshot.png.tmp"
+#define SHOT_ERR "/tmp/info-panel-screenshot.err"
+
+#define V4L_BUFS 4
+#define FRAME_MS 100
+#define POLL_MIN_MS 10
+#define CAM_RETRY_MS 2000
+#define CAM_RETRY_MAX_MS 8000
+#define STATUS_H 36
+#define DECODE_FAIL_REOPEN 40
+
+/* Pan servo on pwmchip0/pwm0 (PD22). Period 20 ms; pulse 0.5–2.5 ms
+ * covers typical hobby full travel (1.0–2.0 ms only reaches ~half on many).
+ *
+ * Default mount: lower pulse → CW (camera yaw right), higher → CCW.
+ * Software travel stops ~1/10 turn (~36°) short of the CCW rail so the
+ * horn does not hit the mechanical stop.
+ */
+#define SERVO_PWM_CHIP "/sys/class/pwm/pwmchip0"
+#define SERVO_PWM_PATH "/sys/class/pwm/pwmchip0/pwm0"
+#define SERVO_PERIOD_NS 20000000L
+#define SERVO_DUTY_RAIL_MIN_NS 500000L
+#define SERVO_DUTY_RAIL_MAX_NS 2500000L
+/* ~18° if 0.5–2.5 ms spans ~180° (half of the earlier 1/10-turn trim). */
+#define SERVO_CCW_MARGIN_NS 200000L
+#define SERVO_DUTY_MIN_NS SERVO_DUTY_RAIL_MIN_NS
+#define SERVO_DUTY_MAX_NS (SERVO_DUTY_RAIL_MAX_NS - SERVO_CCW_MARGIN_NS)
+#define SERVO_DUTY_CENTER_NS 1500000L
+/*
+ * One-shot centering: duty change that slides the image by ~one frame
+ * width. Object at the left/right edge → about half of this step.
+ */
+#define SERVO_NS_PER_FRAME_WIDTH 520000L
+/* Boot: edge↔edge — blocking cosine ramp, one update per 20 ms PWM frame. */
+#define SERVO_SWEEP_TRIPS 3
+#define SERVO_SWEEP_ONEWAY_MS 5000
+/* Match hobby-servo frame (period 20 ms); faster writes just fight the HW. */
+#define SERVO_SWEEP_SLICE_US 20000
+#define SERVO_SWEEP_EDGE_HOLD_MS 80
+/* H6 PWM0 MMIO (avoid sun4i-pwm sysfs re-touching CTRL every duty write). */
+#define SERVO_PWM_PHYS 0x0300a000UL
+#define SERVO_PWM_MAP_LEN 0x400UL
+#define SERVO_PWM_REG_CTRL 0x0
+#define SERVO_PWM_REG_CH0_PRD 0x4
+#define SERVO_PWM_RDY0 (1u << 28)
+
+/* Motion evidence → candidate (camera pixel coords). No OpenCV. */
+#define MOTION_DIFF_THRESH 18
+#define MOTION_MIN_PIXELS 48
+#define MOTION_MIN_SEED_HITS 18
+#define MOTION_PAD_PX 8
+/* Allow large close-up motion (hand fills much of 320x240). */
+#define MOTION_MAX_FRAC_PCT 55
+#define MOTION_MAX_BBOX_AREA_PCT 70
+#define MOTION_GRID 16
+/* Keep mean small: a big moving mass must not cancel itself out. */
+#define MOTION_MEAN_CAP 3
+/* Track FSM / association. */
+#define TRACK_ACQUIRE_NEED 3
+#define TRACK_COAST_FRAMES 5
+/* Blind after a one-shot pan (~1.2s at 10 fps) while the camera settles. */
+#define TRACK_EGO_FRAMES 12
+#define TRACK_EMA_ALPHA 0.45f
+#define TRACK_GATE_FRAC 0.28f
+/* Skip slew when already near center (~6% of width). */
+#define TRACK_SERVO_DEADZONE_FRAC 0.06f
+
+enum track_state {
+	TRACK_IDLE = 0,
+	TRACK_ACQUIRE,
+	TRACK_LOCK,
+	TRACK_COAST,
+	TRACK_EGO_BLIND,
+	TRACK_LOST,
+};
+
+struct shm_buffer {
+	struct wl_buffer *wl_buffer;
+	void *data;
+	size_t size;
+	int width;
+	int height;
+	bool busy;
+};
+
+struct v4l_buf {
+	void *start;
+	size_t length;
+};
+
+enum cam_pixfmt {
+	CAM_FMT_NONE = 0,
+	CAM_FMT_MJPEG,
+	CAM_FMT_YUYV,
+};
+
+struct cam_state {
+	int fd;
+	enum cam_pixfmt fmt;
+	uint32_t fourcc;
+	unsigned width;
+	unsigned height;
+	struct v4l_buf bufs[V4L_BUFS];
+	unsigned nbufs;
+	bool streaming;
+	bool have_frame;
+	char status[96];
+	char device[64];
+	uint64_t next_retry_ms;
+	unsigned retry_ms;
+	unsigned decode_fails;
+	uint8_t *rgb;
+	size_t rgb_size;
+	unsigned rgb_w;
+	unsigned rgb_h;
+	/* Grayscale prev + mask for block-energy motion. */
+	uint8_t *gray_prev;
+	size_t gray_size;
+	uint8_t *motion_mask;
+	size_t mask_size;
+	bool motion_have_prev;
+};
+
+struct motion_candidate {
+	bool valid;
+	float cx, cy;
+	float half_w, half_h;
+	unsigned score;
+};
+
+/* Horizontal track estimate in camera pixel coords. */
+struct track_state_data {
+	enum track_state state;
+	bool have_target;
+	float x;
+	float y;
+	float half_w;
+	float half_h;
+	unsigned acquire_hits;
+	unsigned miss_frames;
+	unsigned ego_frames;
+	/* Last frame diagnostics for the status bar. */
+	bool last_cand;
+	bool last_hit;
+};
+
+struct servo_state {
+	bool enabled;
+	bool ready;
+	int pan_sign; /* +1: object on right → increase duty */
+	long duty_ns;
+	int duty_fd; /* sysfs fallback when MMIO map fails */
+	volatile uint32_t *pwm_regs; /* /dev/mem map of 300a000.pwm */
+	uint32_t period_ticks; /* HW counter period (PRD+1) */
+	bool use_mmio;
+	/* Boot sweep before motion detect / follow. */
+	enum {
+		SERVO_BOOT_WAIT_VIDEO = 0,
+		SERVO_BOOT_GO,
+		SERVO_BOOT_DONE,
+	} boot;
+};
+
+struct app {
+	struct wl_display *display;
+	struct wl_registry *registry;
+	struct wl_compositor *compositor;
+	struct wl_shm *shm;
+	struct xdg_wm_base *wm_base;
+	struct wl_surface *surface;
+	struct xdg_surface *xdg_surface;
+	struct xdg_toplevel *xdg_toplevel;
+	struct wl_output *output;
+	int32_t output_width;
+	int32_t output_height;
+	int32_t mode_width; /* wl_output current mode (hint only) */
+	int32_t mode_height;
+	int32_t scale;
+	bool configured;
+	bool running;
+	struct shm_buffer buffers[2];
+	int buffer_idx;
+	int last_committed;
+	bool have_committed;
+	struct cam_state cam;
+	struct servo_state servo;
+	struct track_state_data track;
+	bool frame_dirty;
+};
+
+static volatile sig_atomic_t screenshot_requested;
+static volatile sig_atomic_t sweep_requested;
+
+#define SWEEP_STATUS_PATH "/tmp/info-panel-track.sweep"
+
+static void track_reset(struct track_state_data *tr);
+
+static const char *track_state_name(enum track_state s)
+{
+	switch (s) {
+	case TRACK_IDLE:
+		return "idle";
+	case TRACK_ACQUIRE:
+		return "acquire";
+	case TRACK_LOCK:
+		return "lock";
+	case TRACK_COAST:
+		return "coast";
+	case TRACK_EGO_BLIND:
+		return "ego";
+	case TRACK_LOST:
+		return "lost";
+	default:
+		return "?";
+	}
+}
+
+static uint64_t monotonic_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+static int create_shm_file(size_t size)
+{
+	char template[] = "/tmp/info-panel-track-XXXXXX";
+	int fd = mkostemp(template, O_CLOEXEC);
+
+	if (fd < 0)
+		return -1;
+	unlink(template);
+	if (ftruncate(fd, (off_t)size) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static void buffer_release(void *data, struct wl_buffer *buf)
+{
+	struct shm_buffer *b = data;
+
+	(void)buf;
+	b->busy = false;
+}
+
+static const struct wl_buffer_listener buffer_listener = {
+	.release = buffer_release,
+};
+
+static int shm_buffer_init(struct app *app, struct shm_buffer *b, int width, int height)
+{
+	const int stride = width * 4;
+
+	b->size = (size_t)stride * (size_t)height;
+	b->width = width;
+	b->height = height;
+	b->busy = false;
+
+	int fd = create_shm_file(b->size);
+	if (fd < 0)
+		return -1;
+
+	b->data = mmap(NULL, b->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (b->data == MAP_FAILED) {
+		close(fd);
+		return -1;
+	}
+
+	struct wl_shm_pool *pool = wl_shm_create_pool(app->shm, fd, (int32_t)b->size);
+	close(fd);
+	b->wl_buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride,
+						 WL_SHM_FORMAT_ARGB8888);
+	wl_shm_pool_destroy(pool);
+	wl_buffer_add_listener(b->wl_buffer, &buffer_listener, b);
+	return 0;
+}
+
+static void shm_buffer_destroy(struct shm_buffer *b)
+{
+	if (b->wl_buffer)
+		wl_buffer_destroy(b->wl_buffer);
+	if (b->data && b->data != MAP_FAILED)
+		munmap(b->data, b->size);
+	memset(b, 0, sizeof(*b));
+}
+
+static void on_sigusr1(int signo)
+{
+	(void)signo;
+	screenshot_requested = 1;
+}
+
+static void on_sigusr2(int signo)
+{
+	(void)signo;
+	sweep_requested = 1;
+}
+
+static void sweep_status_write(const char *text)
+{
+	int fd = open(SWEEP_STATUS_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+		      0644);
+	size_t n;
+
+	if (fd < 0)
+		return;
+	n = strlen(text);
+	if (write(fd, text, n) == (ssize_t)n)
+		(void)write(fd, "\n", 1);
+	close(fd);
+}
+
+static void shot_fail(const char *msg)
+{
+	FILE *f;
+
+	fprintf(stderr, "info-panel-track: screenshot: %s\n", msg);
+	f = fopen(SHOT_ERR, "w");
+	if (f) {
+		fprintf(f, "%s\n", msg);
+		fclose(f);
+	}
+	unlink(SHOT_PNG);
+	unlink(SHOT_TMP);
+}
+
+static void dump_screenshot(struct app *app)
+{
+	struct shm_buffer *b;
+	cairo_surface_t *cs;
+	cairo_status_t st;
+
+	screenshot_requested = 0;
+	unlink(SHOT_ERR);
+
+	if (!app->have_committed) {
+		shot_fail("no frame committed yet");
+		return;
+	}
+	b = &app->buffers[app->last_committed];
+	if (!b->data || b->data == MAP_FAILED || b->width <= 0 || b->height <= 0) {
+		shot_fail("committed buffer is empty");
+		return;
+	}
+
+	cs = cairo_image_surface_create_for_data(
+		b->data, CAIRO_FORMAT_ARGB32, b->width, b->height, b->width * 4);
+	if (cairo_surface_status(cs) != CAIRO_STATUS_SUCCESS) {
+		cairo_surface_destroy(cs);
+		shot_fail("cairo surface failed");
+		return;
+	}
+	cairo_surface_mark_dirty(cs);
+	st = cairo_surface_write_to_png(cs, SHOT_TMP);
+	cairo_surface_destroy(cs);
+	if (st != CAIRO_STATUS_SUCCESS) {
+		shot_fail(cairo_status_to_string(st));
+		return;
+	}
+	if (rename(SHOT_TMP, SHOT_PNG) != 0) {
+		shot_fail("rename failed");
+		return;
+	}
+	chmod(SHOT_PNG, 0644);
+	fprintf(stderr, "info-panel-track: screenshot %dx%d -> %s\n",
+		b->width, b->height, SHOT_PNG);
+}
+
+/* ---- Servo -------------------------------------------------------------- */
+
+static int servo_write_str(const char *path, const char *val)
+{
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, val, strlen(val));
+	close(fd);
+	return (n < 0) ? -1 : 0;
+}
+
+static int servo_write_ll(const char *path, long long v)
+{
+	char buf[32];
+
+	snprintf(buf, sizeof(buf), "%lld", v);
+	return servo_write_str(path, buf);
+}
+
+static void servo_unmap(struct servo_state *sv)
+{
+	if (sv->pwm_regs) {
+		munmap((void *)sv->pwm_regs, SERVO_PWM_MAP_LEN);
+		sv->pwm_regs = NULL;
+	}
+	sv->use_mmio = false;
+	sv->period_ticks = 0;
+}
+
+static void servo_close(struct servo_state *sv)
+{
+	if (sv->duty_fd >= 0) {
+		close(sv->duty_fd);
+		sv->duty_fd = -1;
+	}
+	servo_unmap(sv);
+	if (!sv->ready)
+		return;
+	servo_write_str(SERVO_PWM_PATH "/enable", "0");
+	sv->ready = false;
+}
+
+/*
+ * Map PWM registers so duty updates only touch CH0_PRD. The sun4i-pwm
+ * sysfs path rewrites CTRL on every apply; that can glitch the pulse and
+ * the hobby servo then ticks instead of gliding.
+ */
+static bool servo_map_mmio(struct servo_state *sv)
+{
+	int fd;
+	void *map;
+	uint32_t prd;
+
+	fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+	if (fd < 0) {
+		fprintf(stderr, "info-panel-track: /dev/mem open: %s\n",
+			strerror(errno));
+		return false;
+	}
+	map = mmap(NULL, SERVO_PWM_MAP_LEN, PROT_READ | PROT_WRITE, MAP_SHARED,
+		   fd, (off_t)SERVO_PWM_PHYS);
+	close(fd);
+	if (map == MAP_FAILED) {
+		fprintf(stderr, "info-panel-track: pwm mmap: %s\n",
+			strerror(errno));
+		return false;
+	}
+
+	sv->pwm_regs = (volatile uint32_t *)map;
+	prd = sv->pwm_regs[SERVO_PWM_REG_CH0_PRD / 4u];
+	sv->period_ticks = ((prd >> 16) & 0xffffu) + 1u;
+	if (sv->period_ticks < 2u) {
+		servo_unmap(sv);
+		return false;
+	}
+	sv->use_mmio = true;
+	return true;
+}
+
+static void servo_mmio_wait_rdy(struct servo_state *sv)
+{
+	unsigned i;
+
+	if (!sv->pwm_regs)
+		return;
+	for (i = 0; i < 40u; i++) {
+		if (!(sv->pwm_regs[SERVO_PWM_REG_CTRL / 4u] & SERVO_PWM_RDY0))
+			return;
+		usleep(500);
+	}
+}
+
+static bool servo_init(struct servo_state *sv)
+{
+	const char *env = getenv("INFO_PANEL_SERVO");
+	const char *inv = getenv("INFO_PANEL_SERVO_INVERT");
+
+	memset(sv, 0, sizeof(*sv));
+	sv->pan_sign = -1; /* camera-on-servo: object on right → decrease duty */
+	sv->duty_ns = SERVO_DUTY_CENTER_NS;
+	sv->duty_fd = -1;
+	sv->pwm_regs = NULL;
+	sv->period_ticks = 0;
+	sv->use_mmio = false;
+	if (env && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' ||
+		    env[0] == 'f' || env[0] == 'F')) {
+		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
+		return false;
+	}
+	sv->enabled = true;
+	if (inv && inv[0] && inv[0] != '0' && inv[0] != 'n' && inv[0] != 'N' &&
+	    inv[0] != 'f' && inv[0] != 'F')
+		sv->pan_sign = -sv->pan_sign;
+
+	if (access(SERVO_PWM_PATH "/period", F_OK) != 0) {
+		if (servo_write_str(SERVO_PWM_CHIP "/export", "0") < 0) {
+			fprintf(stderr,
+				"info-panel-track: servo pwm0 missing (need root export)\n");
+			sv->enabled = false;
+			sv->boot = SERVO_BOOT_DONE;
+			return false;
+		}
+		usleep(50000);
+	}
+	servo_write_str(SERVO_PWM_PATH "/enable", "0");
+	if (servo_write_ll(SERVO_PWM_PATH "/period", SERVO_PERIOD_NS) < 0 ||
+	    servo_write_ll(SERVO_PWM_PATH "/duty_cycle", SERVO_DUTY_CENTER_NS) < 0) {
+		fprintf(stderr, "info-panel-track: servo pwm setup failed\n");
+		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
+		return false;
+	}
+	servo_write_str(SERVO_PWM_PATH "/polarity", "normal");
+	if (servo_write_str(SERVO_PWM_PATH "/enable", "1") < 0) {
+		fprintf(stderr, "info-panel-track: servo pwm enable failed\n");
+		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
+		return false;
+	}
+	sv->ready = true;
+	sv->duty_ns = SERVO_DUTY_CENTER_NS;
+	sv->duty_fd = open(SERVO_PWM_PATH "/duty_cycle", O_WRONLY | O_CLOEXEC);
+	if (sv->duty_fd < 0) {
+		fprintf(stderr, "info-panel-track: servo duty fd open failed\n");
+		servo_write_str(SERVO_PWM_PATH "/enable", "0");
+		sv->ready = false;
+		sv->enabled = false;
+		sv->boot = SERVO_BOOT_DONE;
+		return false;
+	}
+	sv->boot = SERVO_BOOT_WAIT_VIDEO;
+	if (servo_map_mmio(sv)) {
+		fprintf(stderr,
+			"info-panel-track: servo pan on %s MMIO (sign=%d, ticks=%u)\n",
+			SERVO_PWM_PATH, sv->pan_sign, sv->period_ticks);
+	} else {
+		fprintf(stderr,
+			"info-panel-track: servo pan on %s sysfs (sign=%d)\n",
+			SERVO_PWM_PATH, sv->pan_sign);
+	}
+	return true;
+}
+
+/* Apply a duty (clamped). Prefer MMIO CH0_PRD-only writes when mapped. */
+static bool servo_set_duty(struct servo_state *sv, long duty_ns)
+{
+	char buf[32];
+	int n;
+	long duty = duty_ns;
+
+	if (!sv->enabled || !sv->ready)
+		return false;
+	if (duty < SERVO_DUTY_MIN_NS)
+		duty = SERVO_DUTY_MIN_NS;
+	else if (duty > SERVO_DUTY_MAX_NS)
+		duty = SERVO_DUTY_MAX_NS;
+	if (duty == sv->duty_ns)
+		return true;
+
+	if (sv->use_mmio && sv->pwm_regs && sv->period_ticks > 1u) {
+		uint32_t dty = (uint32_t)(((uint64_t)duty * (uint64_t)sv->period_ticks) /
+					  (uint64_t)SERVO_PERIOD_NS);
+
+		if (dty > sv->period_ticks)
+			dty = sv->period_ticks;
+		servo_mmio_wait_rdy(sv);
+		sv->pwm_regs[SERVO_PWM_REG_CH0_PRD / 4u] =
+			(dty & 0xffffu) |
+			(((sv->period_ticks - 1u) & 0xffffu) << 16);
+		sv->duty_ns = duty;
+		return true;
+	}
+
+	if (sv->duty_fd < 0)
+		return false;
+	n = snprintf(buf, sizeof(buf), "%ld", duty);
+	if (n < 1)
+		return false;
+	if (lseek(sv->duty_fd, 0, SEEK_SET) < 0)
+		return false;
+	if (write(sv->duty_fd, buf, (size_t)n) != n)
+		return false;
+	sv->duty_ns = duty;
+	return true;
+}
+
+static bool servo_slew(struct servo_state *sv, long delta_ns)
+{
+	long duty;
+
+	if (!sv->enabled || !sv->ready || delta_ns == 0)
+		return false;
+
+	if ((sv->duty_ns >= SERVO_DUTY_MAX_NS && delta_ns > 0) ||
+	    (sv->duty_ns <= SERVO_DUTY_MIN_NS && delta_ns < 0))
+		return false;
+
+	duty = sv->duty_ns + delta_ns;
+	if (duty < SERVO_DUTY_MIN_NS)
+		duty = SERVO_DUTY_MIN_NS;
+	else if (duty > SERVO_DUTY_MAX_NS)
+		duty = SERVO_DUTY_MAX_NS;
+	if (duty == sv->duty_ns)
+		return false;
+	return servo_set_duty(sv, duty);
+}
+
+/*
+ * Blocking cosine ramp: one duty write per servo PWM period (20 ms).
+ * Ease-in/out avoids bang starts; MMIO path avoids sun4i CTRL glitches.
+ * Drain UVC between slices so a multi-second ramp does not stall the cam.
+ */
+static void cam_drain(struct cam_state *cam);
+
+static void servo_ramp_smooth(struct servo_state *sv, struct cam_state *cam,
+			      long target)
+{
+	long from = sv->duty_ns;
+	long span = target - from;
+	long abs_span = span < 0 ? -span : span;
+	long full = SERVO_DUTY_MAX_NS - SERVO_DUTY_MIN_NS;
+	unsigned dur_ms;
+	unsigned nsteps;
+	unsigned i;
+	struct timespec next;
+
+	if (!sv->enabled || !sv->ready)
+		return;
+	if (abs_span < 1) {
+		(void)servo_set_duty(sv, target);
+		return;
+	}
+
+	dur_ms = (unsigned)SERVO_SWEEP_ONEWAY_MS;
+	if (full > 0 && abs_span < full) {
+		dur_ms = (unsigned)((unsigned long)SERVO_SWEEP_ONEWAY_MS *
+				   (unsigned long)abs_span / (unsigned long)full);
+		if (dur_ms < 500u)
+			dur_ms = 500u;
+	}
+
+	nsteps = (dur_ms * 1000u) / (unsigned)SERVO_SWEEP_SLICE_US;
+	if (nsteps < 1u)
+		nsteps = 1u;
+
+	clock_gettime(CLOCK_MONOTONIC, &next);
+	for (i = 1; i <= nsteps; i++) {
+		double t = (double)i / (double)nsteps;
+		double s = 0.5 - 0.5 * cos(M_PI * t);
+		long duty = from + (long)llround((double)span * s);
+
+		(void)servo_set_duty(sv, duty);
+		if (cam && (i % 5u) == 0u)
+			cam_drain(cam);
+		next.tv_nsec += (long)SERVO_SWEEP_SLICE_US * 1000L;
+		if (next.tv_nsec >= 1000000000L) {
+			next.tv_sec += 1;
+			next.tv_nsec -= 1000000000L;
+		}
+		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+	}
+	(void)servo_set_duty(sv, target);
+	if (cam)
+		cam_drain(cam);
+}
+
+static void servo_run_edge_sweep(struct servo_state *sv, struct cam_state *cam,
+				 struct track_state_data *tr)
+{
+	unsigned i;
+	char buf[32];
+
+	fprintf(stderr, "info-panel-track: boot sweep %u× edge-to-edge\n",
+		SERVO_SWEEP_TRIPS);
+	sweep_status_write("running");
+
+	sweep_status_write("home");
+	servo_ramp_smooth(sv, cam, SERVO_DUTY_MIN_NS);
+	usleep((useconds_t)SERVO_SWEEP_EDGE_HOLD_MS * 1000u);
+
+	for (i = 0; i < SERVO_SWEEP_TRIPS; i++) {
+		long tgt = (i % 2u == 0u) ? SERVO_DUTY_MAX_NS : SERVO_DUTY_MIN_NS;
+
+		snprintf(buf, sizeof(buf), "sweep %u/%u", i + 1u, SERVO_SWEEP_TRIPS);
+		sweep_status_write(buf);
+		servo_ramp_smooth(sv, cam, tgt);
+		usleep((useconds_t)SERVO_SWEEP_EDGE_HOLD_MS * 1000u);
+	}
+
+	sweep_status_write("center");
+	servo_ramp_smooth(sv, cam, SERVO_DUTY_CENTER_NS);
+
+	cam->motion_have_prev = false;
+	track_reset(tr);
+	sv->boot = SERVO_BOOT_DONE;
+	sweep_status_write("idle");
+	fprintf(stderr, "info-panel-track: boot sweep done → track\n");
+}
+
+static bool servo_boot_ready(const struct servo_state *sv)
+{
+	return !sv->enabled || sv->boot == SERVO_BOOT_DONE;
+}
+
+static void servo_boot_tick(struct servo_state *sv, struct cam_state *cam,
+			    struct track_state_data *tr, bool have_video,
+			    uint64_t now_ms)
+{
+	(void)now_ms;
+
+	if (!sv->enabled || !sv->ready) {
+		sv->boot = SERVO_BOOT_DONE;
+		return;
+	}
+	if (sv->boot == SERVO_BOOT_DONE)
+		return;
+
+	switch (sv->boot) {
+	case SERVO_BOOT_WAIT_VIDEO:
+		if (!have_video)
+			return;
+		servo_run_edge_sweep(sv, cam, tr);
+		break;
+	case SERVO_BOOT_GO:
+		servo_run_edge_sweep(sv, cam, tr);
+		break;
+	case SERVO_BOOT_DONE:
+	default:
+		break;
+	}
+}
+
+/*
+ * Servo only in LOCK: one wide slew that aims to put the blob on the
+ * optical center, then drop the pixel target into EGO_BLIND (old box is
+ * invalid once the camera has moved).
+ */
+static void servo_follow_track(struct servo_state *sv, struct cam_state *cam,
+			       struct track_state_data *tr)
+{
+	float err;
+	float frac;
+	long step;
+
+	if (!servo_boot_ready(sv))
+		return;
+	if (!sv->enabled || !sv->ready)
+		return;
+	if (tr->state != TRACK_LOCK || !tr->have_target || cam->rgb_w < 2)
+		return;
+
+	err = tr->x - 0.5f * (float)cam->rgb_w;
+	if (fabsf(err) < TRACK_SERVO_DEADZONE_FRAC * (float)cam->rgb_w)
+		return;
+
+	/* err/width ∈ (-0.5..+0.5] typically → scale to frame-width duty. */
+	frac = err / (float)cam->rgb_w;
+	step = (long)lroundf((float)sv->pan_sign * frac *
+			     (float)SERVO_NS_PER_FRAME_WIDTH);
+	if (step == 0)
+		return;
+	{
+		long target = sv->duty_ns + step;
+
+		if (target < SERVO_DUTY_MIN_NS)
+			target = SERVO_DUTY_MIN_NS;
+		else if (target > SERVO_DUTY_MAX_NS)
+			target = SERVO_DUTY_MAX_NS;
+		if (target == sv->duty_ns)
+			return;
+		servo_ramp_smooth(sv, cam, target);
+		tr->have_target = false;
+		tr->acquire_hits = 0;
+		tr->miss_frames = 0;
+		tr->state = TRACK_EGO_BLIND;
+		tr->ego_frames = TRACK_EGO_FRAMES;
+	}
+}
+
+/* ---- Motion evidence + track FSM ---------------------------------------- */
+
+static void track_reset(struct track_state_data *tr)
+{
+	memset(tr, 0, sizeof(*tr));
+	tr->state = TRACK_IDLE;
+}
+
+static void cam_motion_bufs_free(struct cam_state *cam)
+{
+	free(cam->gray_prev);
+	cam->gray_prev = NULL;
+	cam->gray_size = 0;
+	free(cam->motion_mask);
+	cam->motion_mask = NULL;
+	cam->mask_size = 0;
+	cam->motion_have_prev = false;
+}
+
+static void cam_fill_gray(struct cam_state *cam, unsigned w, unsigned h)
+{
+	unsigned x, y;
+
+	for (y = 0; y < h; y++) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		uint8_t *g = cam->gray_prev + (size_t)y * w;
+
+		for (x = 0; x < w; x++) {
+			const uint8_t *p = row + (size_t)x * 3u;
+
+			g[x] = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+		}
+	}
+}
+
+static bool cam_ensure_gray(struct cam_state *cam, unsigned w, unsigned h)
+{
+	size_t need = (size_t)w * (size_t)h;
+
+	if (cam->gray_prev && cam->gray_size >= need &&
+	    cam->motion_mask && cam->mask_size >= need)
+		return true;
+	cam_motion_bufs_free(cam);
+	cam->gray_prev = malloc(need);
+	cam->motion_mask = malloc(need);
+	if (!cam->gray_prev || !cam->motion_mask) {
+		cam_motion_bufs_free(cam);
+		return false;
+	}
+	cam->gray_size = need;
+	cam->mask_size = need;
+	cam->motion_have_prev = false;
+	return true;
+}
+
+/*
+ * Block-energy absdiff. Returns one connected motion blob or invalid.
+ * Soft flood-fill from densest cell, then bbox over mask pixels in that
+ * component (covers the whole blob, not only the peak edge). Still no
+ * fallback to the global extent of every changed pixel.
+ */
+static struct motion_candidate motion_detect_candidate(struct cam_state *cam,
+						       bool reseeds_only)
+{
+	struct motion_candidate out = { 0 };
+	unsigned w = cam->rgb_w;
+	unsigned h = cam->rgb_h;
+	unsigned x, y;
+	unsigned count = 0;
+	unsigned max_pix;
+	uint16_t cell[MOTION_GRID][MOTION_GRID];
+	uint8_t visit[MOTION_GRID][MOTION_GRID];
+	int stack_x[MOTION_GRID * MOTION_GRID];
+	int stack_y[MOTION_GRID * MOTION_GRID];
+	int sp;
+	int seed_cx, seed_cy;
+	unsigned seed_hits, cell_thresh, soft_thresh;
+	int cell_x0, cell_y0, cell_x1, cell_y1;
+	int min_x, min_y, max_x, max_y;
+	unsigned cw, ch;
+	long sum_s = 0;
+	unsigned n_sub = 0;
+	int mean_s;
+	static const int dx4[4] = { 1, -1, 0, 0 };
+	static const int dy4[4] = { 0, 0, 1, -1 };
+
+	if (!cam->rgb || w < 2 || h < 2)
+		return out;
+	if (!cam_ensure_gray(cam, w, h))
+		return out;
+
+	if (!cam->motion_have_prev) {
+		cam_fill_gray(cam, w, h);
+		cam->motion_have_prev = true;
+		return out;
+	}
+
+	if (reseeds_only) {
+		cam_fill_gray(cam, w, h);
+		return out;
+	}
+
+	for (y = 0; y < h; y += 4) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		const uint8_t *gprev = cam->gray_prev + (size_t)y * w;
+
+		for (x = 0; x < w; x += 4) {
+			const uint8_t *p = row + (size_t)x * 3u;
+			uint8_t g = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+
+			sum_s += (int)g - (int)gprev[x];
+			n_sub++;
+		}
+	}
+	mean_s = n_sub ? (int)(sum_s / (long)n_sub) : 0;
+	if (mean_s > MOTION_MEAN_CAP)
+		mean_s = MOTION_MEAN_CAP;
+	else if (mean_s < -MOTION_MEAN_CAP)
+		mean_s = -MOTION_MEAN_CAP;
+
+	memset(cam->motion_mask, 0, (size_t)w * (size_t)h);
+	memset(cell, 0, sizeof(cell));
+	cw = (w + MOTION_GRID - 1) / MOTION_GRID;
+	ch = (h + MOTION_GRID - 1) / MOTION_GRID;
+	if (cw < 1)
+		cw = 1;
+	if (ch < 1)
+		ch = 1;
+
+	for (y = 0; y < h; y++) {
+		const uint8_t *row = cam->rgb + (size_t)y * w * 3u;
+		uint8_t *gprev = cam->gray_prev + (size_t)y * w;
+		uint8_t *mask = cam->motion_mask + (size_t)y * w;
+		unsigned cy = y / ch;
+
+		if (cy >= MOTION_GRID)
+			cy = MOTION_GRID - 1;
+		for (x = 0; x < w; x++) {
+			const uint8_t *p = row + (size_t)x * 3u;
+			uint8_t g = (uint8_t)((77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8);
+			int delta = (int)g - (int)gprev[x] - mean_s;
+			unsigned resid = delta < 0 ? (unsigned)(-delta) : (unsigned)delta;
+			unsigned cx_cell;
+
+			gprev[x] = g;
+			if (resid < MOTION_DIFF_THRESH)
+				continue;
+			mask[x] = 1;
+			count++;
+			cx_cell = x / cw;
+			if (cx_cell >= MOTION_GRID)
+				cx_cell = MOTION_GRID - 1;
+			cell[cy][cx_cell]++;
+		}
+	}
+
+	max_pix = (unsigned)(((unsigned long)w * (unsigned long)h *
+			      (unsigned long)MOTION_MAX_FRAC_PCT) / 100ul);
+	if (count > max_pix || count < MOTION_MIN_PIXELS)
+		return out;
+
+	seed_cx = seed_cy = 0;
+	seed_hits = 0;
+	for (y = 0; y < MOTION_GRID; y++) {
+		for (x = 0; x < MOTION_GRID; x++) {
+			if (cell[y][x] > seed_hits) {
+				seed_hits = cell[y][x];
+				seed_cx = (int)x;
+				seed_cy = (int)y;
+			}
+		}
+	}
+	if (seed_hits < MOTION_MIN_SEED_HITS)
+		return out;
+
+	/* Soft core: join cells that are a modest fraction of the peak. */
+	cell_thresh = seed_hits / 12u;
+	if (cell_thresh < 2u)
+		cell_thresh = 2u;
+	/* Then grow into weaker neighbors so the bbox covers the full blob. */
+	soft_thresh = seed_hits / 24u;
+	if (soft_thresh < 1u)
+		soft_thresh = 1u;
+
+	memset(visit, 0, sizeof(visit));
+	sp = 0;
+	stack_x[sp] = seed_cx;
+	stack_y[sp] = seed_cy;
+	sp++;
+	visit[seed_cy][seed_cx] = 1;
+	cell_x0 = cell_x1 = seed_cx;
+	cell_y0 = cell_y1 = seed_cy;
+
+	/* Phase 1 — dense core. */
+	while (sp > 0) {
+		int cx_cell, cy_cell;
+		int k;
+
+		sp--;
+		cx_cell = stack_x[sp];
+		cy_cell = stack_y[sp];
+		if (cx_cell < cell_x0)
+			cell_x0 = cx_cell;
+		if (cx_cell > cell_x1)
+			cell_x1 = cx_cell;
+		if (cy_cell < cell_y0)
+			cell_y0 = cy_cell;
+		if (cy_cell > cell_y1)
+			cell_y1 = cy_cell;
+		for (k = 0; k < 4; k++) {
+			int nx = cx_cell + dx4[k];
+			int ny = cy_cell + dy4[k];
+
+			if (nx < 0 || ny < 0 || nx >= MOTION_GRID || ny >= MOTION_GRID)
+				continue;
+			if (visit[ny][nx] || cell[ny][nx] < cell_thresh)
+				continue;
+			visit[ny][nx] = 1;
+			stack_x[sp] = nx;
+			stack_y[sp] = ny;
+			sp++;
+		}
+	}
+
+	/* Phase 2 — soft grow from every core cell. */
+	{
+		int grew = 1;
+
+		while (grew) {
+			int cy_cell, cx_cell, k;
+
+			grew = 0;
+			for (cy_cell = 0; cy_cell < MOTION_GRID; cy_cell++) {
+				for (cx_cell = 0; cx_cell < MOTION_GRID; cx_cell++) {
+					if (!visit[cy_cell][cx_cell])
+						continue;
+					for (k = 0; k < 4; k++) {
+						int nx = cx_cell + dx4[k];
+						int ny = cy_cell + dy4[k];
+
+						if (nx < 0 || ny < 0 ||
+						    nx >= MOTION_GRID || ny >= MOTION_GRID)
+							continue;
+						if (visit[ny][nx] || cell[ny][nx] < soft_thresh)
+							continue;
+						visit[ny][nx] = 1;
+						grew = 1;
+						if (nx < cell_x0)
+							cell_x0 = nx;
+						if (nx > cell_x1)
+							cell_x1 = nx;
+						if (ny < cell_y0)
+							cell_y0 = ny;
+						if (ny > cell_y1)
+							cell_y1 = ny;
+					}
+				}
+			}
+		}
+	}
+
+	min_x = (int)w;
+	min_y = (int)h;
+	max_x = -1;
+	max_y = -1;
+	{
+		unsigned x0 = (unsigned)cell_x0 * cw;
+		unsigned y0 = (unsigned)cell_y0 * ch;
+		unsigned x1 = (unsigned)(cell_x1 + 1) * cw;
+		unsigned y1 = (unsigned)(cell_y1 + 1) * ch;
+
+		if (x1 > w)
+			x1 = w;
+		if (y1 > h)
+			y1 = h;
+		for (y = y0; y < y1; y++) {
+			const uint8_t *mask = cam->motion_mask + (size_t)y * w;
+			unsigned cy = y / ch;
+
+			if (cy >= MOTION_GRID)
+				cy = MOTION_GRID - 1;
+			for (x = x0; x < x1; x++) {
+				unsigned cx_cell = x / cw;
+
+				if (cx_cell >= MOTION_GRID)
+					cx_cell = MOTION_GRID - 1;
+				if (!visit[cy][cx_cell] || !mask[x])
+					continue;
+				if ((int)x < min_x)
+					min_x = (int)x;
+				if ((int)x > max_x)
+					max_x = (int)x;
+				if ((int)y < min_y)
+					min_y = (int)y;
+				if ((int)y > max_y)
+					max_y = (int)y;
+			}
+		}
+	}
+
+	if (max_x < min_x || max_y < min_y)
+		return out;
+
+	{
+		int bw = max_x - min_x + 1;
+		int bh = max_y - min_y + 1;
+		unsigned long area = (unsigned long)bw * (unsigned long)bh;
+		unsigned long max_area =
+			((unsigned long)w * (unsigned long)h *
+			 (unsigned long)MOTION_MAX_BBOX_AREA_PCT) / 100ul;
+
+		if (area > max_area)
+			return out;
+
+		out.valid = true;
+		out.cx = 0.5f * (float)(min_x + max_x);
+		out.cy = 0.5f * (float)(min_y + max_y);
+		out.half_w = 0.5f * (float)bw + (float)MOTION_PAD_PX;
+		out.half_h = 0.5f * (float)bh + (float)MOTION_PAD_PX;
+		out.score = seed_hits;
+	}
+	return out;
+}
+
+static bool track_associate(struct track_state_data *tr, struct cam_state *cam,
+			    const struct motion_candidate *cand)
+{
+	float gate_x, gate_y;
+
+	if (!cand->valid)
+		return false;
+	if (!tr->have_target)
+		return true;
+
+	gate_x = TRACK_GATE_FRAC * (float)cam->rgb_w;
+	gate_y = TRACK_GATE_FRAC * (float)cam->rgb_h;
+	if (gate_x < 16.f)
+		gate_x = 16.f;
+	if (gate_y < 12.f)
+		gate_y = 12.f;
+	if (fabsf(cand->cx - tr->x) > gate_x)
+		return false;
+	if (fabsf(cand->cy - tr->y) > gate_y)
+		return false;
+	return true;
+}
+
+static void track_apply_measure(struct track_state_data *tr,
+				const struct motion_candidate *cand)
+{
+	if (!tr->have_target) {
+		tr->x = cand->cx;
+		tr->y = cand->cy;
+		tr->half_w = cand->half_w;
+		tr->half_h = cand->half_h;
+		tr->have_target = true;
+		return;
+	}
+	tr->x = TRACK_EMA_ALPHA * cand->cx + (1.f - TRACK_EMA_ALPHA) * tr->x;
+	tr->y = TRACK_EMA_ALPHA * cand->cy + (1.f - TRACK_EMA_ALPHA) * tr->y;
+	tr->half_w = TRACK_EMA_ALPHA * cand->half_w +
+		     (1.f - TRACK_EMA_ALPHA) * tr->half_w;
+	tr->half_h = TRACK_EMA_ALPHA * cand->half_h +
+		     (1.f - TRACK_EMA_ALPHA) * tr->half_h;
+	tr->have_target = true;
+}
+
+static void track_on_frame(struct track_state_data *tr, struct cam_state *cam)
+{
+	struct motion_candidate cand;
+	bool hit;
+
+	tr->last_cand = false;
+	tr->last_hit = false;
+
+	if (tr->state == TRACK_EGO_BLIND) {
+		(void)motion_detect_candidate(cam, true);
+		if (tr->ego_frames > 0)
+			tr->ego_frames--;
+		if (tr->ego_frames == 0) {
+			/* Never resume LOCK on a pre-pan pixel estimate. */
+			tr->have_target = false;
+			tr->acquire_hits = 0;
+			tr->state = TRACK_IDLE;
+		}
+		return;
+	}
+
+	cand = motion_detect_candidate(cam, false);
+	tr->last_cand = cand.valid;
+	hit = track_associate(tr, cam, &cand);
+	tr->last_hit = hit;
+
+	switch (tr->state) {
+	case TRACK_IDLE:
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->state = TRACK_ACQUIRE;
+			tr->acquire_hits = 1;
+			tr->miss_frames = 0;
+		}
+		break;
+	case TRACK_ACQUIRE:
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->acquire_hits++;
+			if (tr->acquire_hits >= TRACK_ACQUIRE_NEED) {
+				tr->state = TRACK_LOCK;
+				tr->miss_frames = 0;
+			}
+		} else if (tr->acquire_hits > 0) {
+			tr->acquire_hits--;
+			if (tr->acquire_hits == 0) {
+				tr->have_target = false;
+				tr->state = TRACK_IDLE;
+			}
+		} else {
+			tr->have_target = false;
+			tr->state = TRACK_IDLE;
+		}
+		break;
+	case TRACK_LOCK:
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->miss_frames = 0;
+		} else {
+			tr->state = TRACK_COAST;
+			tr->miss_frames = TRACK_COAST_FRAMES;
+		}
+		break;
+	case TRACK_COAST:
+		if (hit) {
+			track_apply_measure(tr, &cand);
+			tr->state = TRACK_LOCK;
+			tr->miss_frames = 0;
+		} else if (tr->miss_frames > 0) {
+			tr->miss_frames--;
+			if (tr->miss_frames == 0) {
+				tr->have_target = false;
+				tr->state = TRACK_LOST;
+			}
+		} else {
+			tr->have_target = false;
+			tr->state = TRACK_LOST;
+		}
+		break;
+	case TRACK_LOST:
+		tr->have_target = false;
+		tr->state = TRACK_IDLE;
+		break;
+	case TRACK_EGO_BLIND:
+	default:
+		break;
+	}
+}
+
+/* ---- V4L2 / decode ------------------------------------------------------ */
+
+static void cam_unmap(struct cam_state *cam)
+{
+	unsigned i;
+
+	for (i = 0; i < cam->nbufs; i++) {
+		if (cam->bufs[i].start && cam->bufs[i].start != MAP_FAILED)
+			munmap(cam->bufs[i].start, cam->bufs[i].length);
+		cam->bufs[i].start = NULL;
+		cam->bufs[i].length = 0;
+	}
+	cam->nbufs = 0;
+}
+
+static void cam_release(struct cam_state *cam)
+{
+	if (cam->streaming && cam->fd >= 0) {
+		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+		ioctl(cam->fd, VIDIOC_STREAMOFF, &type);
+		cam->streaming = false;
+	}
+	cam_unmap(cam);
+	if (cam->fd >= 0) {
+		close(cam->fd);
+		cam->fd = -1;
+	}
+	cam->fmt = CAM_FMT_NONE;
+}
+
+static void cam_close(struct cam_state *cam)
+{
+	cam_release(cam);
+	free(cam->rgb);
+	cam->rgb = NULL;
+	cam->rgb_size = 0;
+	cam->rgb_w = cam->rgb_h = 0;
+	cam_motion_bufs_free(cam);
+	cam->have_frame = false;
+}
+
+static int xioctl(int fd, unsigned long req, void *arg)
+{
+	int r;
+
+	do {
+		r = ioctl(fd, req, arg);
+	} while (r < 0 && errno == EINTR);
+	return r;
+}
+
+static bool cam_ensure_rgb(struct cam_state *cam, unsigned w, unsigned h)
+{
+	size_t need = (size_t)w * (size_t)h * 3u;
+
+	if (cam->rgb && cam->rgb_size >= need && cam->rgb_w == w && cam->rgb_h == h)
+		return true;
+	free(cam->rgb);
+	cam->rgb = malloc(need);
+	if (!cam->rgb) {
+		cam->rgb_size = 0;
+		cam->rgb_w = cam->rgb_h = 0;
+		return false;
+	}
+	cam->rgb_size = need;
+	cam->rgb_w = w;
+	cam->rgb_h = h;
+	cam_motion_bufs_free(cam);
+	return true;
+}
+
+struct jpeg_err {
+	struct jpeg_error_mgr pub;
+	jmp_buf setjmp_buffer;
+};
+
+static void jpeg_err_exit(j_common_ptr cinfo)
+{
+	struct jpeg_err *err = (struct jpeg_err *)cinfo->err;
+
+	longjmp(err->setjmp_buffer, 1);
+}
+
+static void jpeg_err_output(j_common_ptr cinfo)
+{
+	(void)cinfo;
+}
+
+static bool decode_mjpeg(struct cam_state *cam, const uint8_t *data, size_t len)
+{
+	struct jpeg_decompress_struct cinfo;
+	struct jpeg_err jerr;
+	unsigned w, h;
+	int row_stride;
+	JSAMPROW rowptr[1];
+
+	if (len < 4)
+		return false;
+
+	cinfo.err = jpeg_std_error(&jerr.pub);
+	jerr.pub.error_exit = jpeg_err_exit;
+	jerr.pub.output_message = jpeg_err_output;
+	if (setjmp(jerr.setjmp_buffer)) {
+		jpeg_destroy_decompress(&cinfo);
+		return false;
+	}
+
+	jpeg_create_decompress(&cinfo);
+	jpeg_mem_src(&cinfo, (unsigned char *)data, (unsigned long)len);
+	if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) {
+		jpeg_destroy_decompress(&cinfo);
+		return false;
+	}
+	cinfo.out_color_space = JCS_RGB;
+	jpeg_start_decompress(&cinfo);
+	w = cinfo.output_width;
+	h = cinfo.output_height;
+	if (w == 0 || h == 0 || cinfo.output_components != 3) {
+		jpeg_destroy_decompress(&cinfo);
+		return false;
+	}
+	if (!cam_ensure_rgb(cam, w, h)) {
+		jpeg_destroy_decompress(&cinfo);
+		return false;
+	}
+	row_stride = (int)w * 3;
+	while (cinfo.output_scanline < cinfo.output_height) {
+		rowptr[0] = cam->rgb + (size_t)cinfo.output_scanline * (size_t)row_stride;
+		jpeg_read_scanlines(&cinfo, rowptr, 1);
+	}
+	jpeg_finish_decompress(&cinfo);
+	jpeg_destroy_decompress(&cinfo);
+	cam->have_frame = true;
+	return true;
+}
+
+#ifndef CLAMP
+#define CLAMP(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
+#endif
+
+static void yuyv_to_rgb(const uint8_t *src, uint8_t *dst, unsigned w, unsigned h)
+{
+	unsigned x, y;
+
+	for (y = 0; y < h; y++) {
+		const uint8_t *s = src + (size_t)y * (size_t)w * 2u;
+		uint8_t *d = dst + (size_t)y * (size_t)w * 3u;
+
+		for (x = 0; x + 1 < w; x += 2) {
+			int y0 = s[0], u = s[1], y1 = s[2], v = s[3];
+			int c, d0, e;
+
+			s += 4;
+			c = y0 - 16;
+			d0 = u - 128;
+			e = v - 128;
+			d[0] = (uint8_t)CLAMP((298 * c + 409 * e + 128) >> 8, 0, 255);
+			d[1] = (uint8_t)CLAMP((298 * c - 100 * d0 - 208 * e + 128) >> 8, 0, 255);
+			d[2] = (uint8_t)CLAMP((298 * c + 516 * d0 + 128) >> 8, 0, 255);
+			c = y1 - 16;
+			d[3] = (uint8_t)CLAMP((298 * c + 409 * e + 128) >> 8, 0, 255);
+			d[4] = (uint8_t)CLAMP((298 * c - 100 * d0 - 208 * e + 128) >> 8, 0, 255);
+			d[5] = (uint8_t)CLAMP((298 * c + 516 * d0 + 128) >> 8, 0, 255);
+			d += 6;
+		}
+	}
+}
+
+static bool decode_yuyv(struct cam_state *cam, const uint8_t *data, size_t len)
+{
+	size_t need = (size_t)cam->width * (size_t)cam->height * 2u;
+
+	if (len < need || cam->width < 2)
+		return false;
+	if (!cam_ensure_rgb(cam, cam->width, cam->height))
+		return false;
+	yuyv_to_rgb(data, cam->rgb, cam->width, cam->height);
+	cam->have_frame = true;
+	return true;
+}
+
+static bool cam_try_fmt(int fd, uint32_t fourcc, unsigned *w, unsigned *h)
+{
+	struct v4l2_format fmt;
+
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.width = *w;
+	fmt.fmt.pix.height = *h;
+	fmt.fmt.pix.pixelformat = fourcc;
+	fmt.fmt.pix.field = V4L2_FIELD_NONE;
+	if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0)
+		return false;
+	if (fmt.fmt.pix.pixelformat != fourcc)
+		return false;
+	*w = fmt.fmt.pix.width;
+	*h = fmt.fmt.pix.height;
+	return *w > 0 && *h > 0;
+}
+
+static bool cam_init_mmap(struct cam_state *cam)
+{
+	struct v4l2_requestbuffers req;
+	unsigned i;
+
+	memset(&req, 0, sizeof(req));
+	req.count = V4L_BUFS;
+	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory = V4L2_MEMORY_MMAP;
+	if (xioctl(cam->fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 2)
+		return false;
+
+	cam->nbufs = req.count > V4L_BUFS ? V4L_BUFS : req.count;
+	for (i = 0; i < cam->nbufs; i++) {
+		struct v4l2_buffer buf;
+
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index = i;
+		if (xioctl(cam->fd, VIDIOC_QUERYBUF, &buf) < 0)
+			return false;
+		cam->bufs[i].length = buf.length;
+		cam->bufs[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+					  MAP_SHARED, cam->fd, buf.m.offset);
+		if (cam->bufs[i].start == MAP_FAILED)
+			return false;
+		if (xioctl(cam->fd, VIDIOC_QBUF, &buf) < 0)
+			return false;
+	}
+	return true;
+}
+
+static bool parse_size_env(unsigned *w, unsigned *h)
+{
+	const char *s = getenv("INFO_PANEL_CAMERA_SIZE");
+	unsigned tw, th;
+
+	if (!s || !*s)
+		return false;
+	if (sscanf(s, "%ux%u", &tw, &th) != 2 && sscanf(s, "%uX%u", &tw, &th) != 2)
+		return false;
+	if (tw < 160 || th < 120 || tw > 3840 || th > 2160)
+		return false;
+	*w = tw;
+	*h = th;
+	return true;
+}
+
+static bool cam_open_path(struct cam_state *cam, const char *path)
+{
+	struct v4l2_capability cap;
+	static const struct {
+		uint32_t fourcc;
+		enum cam_pixfmt fmt;
+	} formats[] = {
+		{ V4L2_PIX_FMT_YUYV, CAM_FMT_YUYV },
+		{ V4L2_PIX_FMT_MJPEG, CAM_FMT_MJPEG },
+	};
+	static const unsigned sizes[][2] = {
+		{ 320, 240 },
+		{ 640, 480 },
+		{ 800, 600 },
+	};
+	unsigned wi, fi, w, h;
+	enum v4l2_buf_type type;
+	struct v4l2_streamparm parm;
+	int fd;
+
+	fd = open(path, O_RDWR | O_NONBLOCK);
+	if (fd < 0)
+		return false;
+	if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+		close(fd);
+		return false;
+	}
+	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) ||
+	    !(cap.capabilities & V4L2_CAP_STREAMING)) {
+		close(fd);
+		return false;
+	}
+
+	cam->fd = fd;
+	snprintf(cam->device, sizeof(cam->device), "%s", path);
+
+	for (fi = 0; fi < sizeof(formats) / sizeof(formats[0]); fi++) {
+		unsigned env_w = 0, env_h = 0;
+		bool have_env = parse_size_env(&env_w, &env_h);
+
+		for (wi = 0; wi < sizeof(sizes) / sizeof(sizes[0]) + (have_env ? 1u : 0u); wi++) {
+			if (have_env && wi == 0) {
+				w = env_w;
+				h = env_h;
+			} else {
+				unsigned idx = have_env ? wi - 1 : wi;
+
+				if (idx >= sizeof(sizes) / sizeof(sizes[0]))
+					break;
+				w = sizes[idx][0];
+				h = sizes[idx][1];
+			}
+			if (!cam_try_fmt(fd, formats[fi].fourcc, &w, &h))
+				continue;
+			cam->fmt = formats[fi].fmt;
+			cam->fourcc = formats[fi].fourcc;
+			cam->width = w;
+			cam->height = h;
+
+			memset(&parm, 0, sizeof(parm));
+			parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			if (xioctl(fd, VIDIOC_G_PARM, &parm) == 0) {
+				parm.parm.capture.timeperframe.numerator = 1;
+				parm.parm.capture.timeperframe.denominator = 10;
+				xioctl(fd, VIDIOC_S_PARM, &parm);
+			}
+
+			if (!cam_init_mmap(cam)) {
+				cam_unmap(cam);
+				continue;
+			}
+			type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+				cam_unmap(cam);
+				continue;
+			}
+			cam->streaming = true;
+			cam->retry_ms = CAM_RETRY_MS;
+			cam->decode_fails = 0;
+			{
+				struct timespec slp = { .tv_sec = 0, .tv_nsec = 150000000L };
+
+				nanosleep(&slp, NULL);
+			}
+			snprintf(cam->status, sizeof(cam->status), "%s %ux%u %s",
+				 path, w, h,
+				 cam->fmt == CAM_FMT_MJPEG ? "MJPEG" : "YUYV");
+			fprintf(stderr, "info-panel-track: opened %s\n", cam->status);
+			return true;
+		}
+	}
+
+	cam_release(cam);
+	return false;
+}
+
+static bool cam_find_and_open(struct cam_state *cam)
+{
+	const char *env = getenv("INFO_PANEL_CAMERA_DEVICE");
+	char path[64];
+	int i;
+
+	cam_release(cam);
+
+	if (env && *env) {
+		if (cam_open_path(cam, env))
+			return true;
+		snprintf(cam->status, sizeof(cam->status),
+			 cam->have_frame ? "reconnecting… (%s)" : "open failed: %s", env);
+		return false;
+	}
+
+	for (i = 0; i < 16; i++) {
+		snprintf(path, sizeof(path), "/dev/video%d", i);
+		if (cam_open_path(cam, path))
+			return true;
+	}
+	snprintf(cam->status, sizeof(cam->status),
+		 cam->have_frame ? "reconnecting…" : "no UVC capture device");
+	return false;
+}
+
+static void cam_note_disconnect(struct cam_state *cam, const char *why)
+{
+	(void)why;
+	snprintf(cam->status, sizeof(cam->status),
+		 cam->have_frame ? "reconnecting…" : "camera lost");
+	cam_release(cam);
+	if (cam->retry_ms < CAM_RETRY_MS)
+		cam->retry_ms = CAM_RETRY_MS;
+	else if (cam->retry_ms < CAM_RETRY_MAX_MS) {
+		cam->retry_ms *= 2;
+		if (cam->retry_ms > CAM_RETRY_MAX_MS)
+			cam->retry_ms = CAM_RETRY_MAX_MS;
+	}
+	cam->next_retry_ms = monotonic_ms() + cam->retry_ms;
+}
+
+static void cam_drain(struct cam_state *cam)
+{
+	struct v4l2_buffer buf;
+
+	if (!cam || cam->fd < 0 || !cam->streaming)
+		return;
+
+	for (;;) {
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		if (xioctl(cam->fd, VIDIOC_DQBUF, &buf) < 0) {
+			if (errno == EAGAIN)
+				break;
+			return;
+		}
+		if (buf.index < cam->nbufs)
+			(void)xioctl(cam->fd, VIDIOC_QBUF, &buf);
+	}
+}
+
+static void cam_grab(struct cam_state *cam, struct track_state_data *tr,
+		     bool track_enable)
+{
+	struct v4l2_buffer buf;
+	struct v4l2_buffer latest;
+	bool have_latest = false;
+
+	if (cam->fd < 0 || !cam->streaming)
+		return;
+
+	for (;;) {
+		memset(&buf, 0, sizeof(buf));
+		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		buf.memory = V4L2_MEMORY_MMAP;
+		if (xioctl(cam->fd, VIDIOC_DQBUF, &buf) < 0) {
+			if (errno == EAGAIN)
+				break;
+			cam_note_disconnect(cam, strerror(errno));
+			return;
+		}
+		if (buf.index >= cam->nbufs) {
+			xioctl(cam->fd, VIDIOC_QBUF, &buf);
+			continue;
+		}
+		if (have_latest) {
+			if (xioctl(cam->fd, VIDIOC_QBUF, &latest) < 0) {
+				cam_note_disconnect(cam, strerror(errno));
+				return;
+			}
+		}
+		latest = buf;
+		have_latest = true;
+	}
+
+	if (!have_latest)
+		return;
+
+	{
+		const uint8_t *p = cam->bufs[latest.index].start;
+		size_t len = latest.bytesused;
+		bool ok = false;
+
+		if (cam->fmt == CAM_FMT_MJPEG)
+			ok = decode_mjpeg(cam, p, len);
+		else if (cam->fmt == CAM_FMT_YUYV)
+			ok = decode_yuyv(cam, p, len);
+		if (ok) {
+			cam->decode_fails = 0;
+			if (track_enable)
+				track_on_frame(tr, cam);
+			else {
+				/* Keep gray baseline warm without arming detect. */
+				(void)motion_detect_candidate(cam, true);
+				tr->last_cand = false;
+				tr->last_hit = false;
+			}
+			snprintf(cam->status, sizeof(cam->status), "%s %ux%u %s",
+				 cam->device, cam->width, cam->height,
+				 cam->fmt == CAM_FMT_MJPEG ? "MJPEG" : "YUYV");
+		} else {
+			cam->decode_fails++;
+			if (cam->decode_fails >= DECODE_FAIL_REOPEN) {
+				cam_note_disconnect(cam, "decode stall");
+				return;
+			}
+		}
+	}
+
+	if (xioctl(cam->fd, VIDIOC_QBUF, &latest) < 0)
+		cam_note_disconnect(cam, strerror(errno));
+}
+
+/* ---- draw --------------------------------------------------------------- */
+
+struct letterbox {
+	int x0, y0, vw, vh;
+};
+
+static void letterbox_geom(unsigned sw, unsigned sh, int dw, int dh, int top_pad,
+			   struct letterbox *lb)
+{
+	int view_h = dh - top_pad;
+
+	lb->x0 = lb->y0 = 0;
+	lb->vw = lb->vh = 0;
+	if (view_h < 1 || sw < 1 || sh < 1)
+		return;
+
+	if ((int64_t)sw * view_h > (int64_t)sh * dw) {
+		lb->vw = dw;
+		lb->vh = (int)((int64_t)sh * dw / sw);
+	} else {
+		lb->vh = view_h;
+		lb->vw = (int)((int64_t)sw * view_h / sh);
+	}
+	if (lb->vw < 1)
+		lb->vw = 1;
+	if (lb->vh < 1)
+		lb->vh = 1;
+	lb->x0 = (dw - lb->vw) / 2;
+	lb->y0 = top_pad + (view_h - lb->vh) / 2;
+}
+
+static void blit_rgb_letterbox(const uint8_t *rgb, unsigned sw, unsigned sh,
+			       uint32_t *dst, int dw, int dh, int top_pad,
+			       struct letterbox *out_lb)
+{
+	struct letterbox lb;
+	int y, x;
+
+	letterbox_geom(sw, sh, dw, dh, top_pad, &lb);
+	if (out_lb)
+		*out_lb = lb;
+	if (lb.vw < 1 || lb.vh < 1)
+		return;
+
+	for (y = 0; y < lb.vh; y++) {
+		unsigned sy = (unsigned)((int64_t)y * sh / lb.vh);
+		const uint8_t *row = rgb + (size_t)sy * sw * 3u;
+		uint32_t *out = dst + (size_t)(lb.y0 + y) * (size_t)dw + (size_t)lb.x0;
+
+		for (x = 0; x < lb.vw; x++) {
+			unsigned sx = (unsigned)((int64_t)x * sw / lb.vw);
+			const uint8_t *p = row + (size_t)sx * 3u;
+
+			out[x] = 0xff000000u |
+				 ((uint32_t)p[0] << 16) |
+				 ((uint32_t)p[1] << 8) |
+				 (uint32_t)p[2];
+		}
+	}
+}
+
+static void draw_panel(struct app *app, struct shm_buffer *b)
+{
+	cairo_surface_t *cs = cairo_image_surface_create_for_data(
+		b->data, CAIRO_FORMAT_ARGB32, b->width, b->height, b->width * 4);
+	cairo_t *cr = cairo_create(cs);
+	const double w = b->width;
+	const double h = b->height;
+	char line[192];
+	struct letterbox lb = { 0 };
+
+	cairo_set_source_rgb(cr, 0.02, 0.02, 0.04);
+	cairo_paint(cr);
+
+	if (app->cam.have_frame && app->cam.rgb)
+		blit_rgb_letterbox(app->cam.rgb, app->cam.rgb_w, app->cam.rgb_h,
+				   (uint32_t *)b->data, b->width, b->height, STATUS_H,
+				   &lb);
+
+		/* Track bbox only after boot sweep, with a real target. */
+	if (servo_boot_ready(&app->servo) && app->track.have_target &&
+	    lb.vw > 0 && lb.vh > 0 &&
+	    app->cam.rgb_w > 0 && app->cam.rgb_h > 0 &&
+	    (app->track.state == TRACK_LOCK || app->track.state == TRACK_COAST ||
+	     app->track.state == TRACK_ACQUIRE)) {
+		double sx = (double)lb.vw / (double)app->cam.rgb_w;
+		double sy = (double)lb.vh / (double)app->cam.rgb_h;
+		float hw = app->track.half_w > 4.f ? app->track.half_w : 4.f;
+		float hh = app->track.half_h > 4.f ? app->track.half_h : 4.f;
+		double rx = lb.x0 + (app->track.x - hw) * sx;
+		double ry = lb.y0 + (app->track.y - hh) * sy;
+		double rw = (2.0 * hw) * sx;
+		double rh = (2.0 * hh) * sy;
+
+		if (app->track.state == TRACK_LOCK)
+			cairo_set_source_rgb(cr, 1.0, 0.92, 0.1);
+		else if (app->track.state == TRACK_ACQUIRE)
+			cairo_set_source_rgb(cr, 0.85, 0.85, 0.90);
+		else
+			cairo_set_source_rgb(cr, 0.70, 0.65, 0.20);
+		cairo_set_line_width(cr, 3.0);
+		cairo_rectangle(cr, rx, ry, rw, rh);
+		cairo_stroke(cr);
+	}
+
+	cairo_set_source_rgba(cr, 0.04, 0.07, 0.12, 0.92);
+	cairo_rectangle(cr, 0, 0, w, STATUS_H);
+	cairo_fill(cr);
+
+	cairo_set_source_rgb(cr, 0.20, 0.75, 0.45);
+	cairo_rectangle(cr, 0, 0, w, 3);
+	cairo_fill(cr);
+
+	cairo_select_font_face(cr, "Liberation Sans", CAIRO_FONT_SLANT_NORMAL,
+			       CAIRO_FONT_WEIGHT_BOLD);
+	cairo_set_font_size(cr, 16);
+	cairo_set_source_rgb(cr, 0.85, 0.90, 0.95);
+	{
+		char st[48];
+
+		if (!servo_boot_ready(&app->servo)) {
+			switch (app->servo.boot) {
+			case SERVO_BOOT_WAIT_VIDEO:
+				snprintf(st, sizeof(st), "boot wait");
+				break;
+			case SERVO_BOOT_GO:
+				snprintf(st, sizeof(st), "boot sweep");
+				break;
+			default:
+				snprintf(st, sizeof(st), "boot");
+				break;
+			}
+		} else {
+			switch (app->track.state) {
+			case TRACK_ACQUIRE:
+				snprintf(st, sizeof(st), "acquire %u/%u",
+					 app->track.acquire_hits, TRACK_ACQUIRE_NEED);
+				break;
+			case TRACK_COAST:
+				snprintf(st, sizeof(st), "coast %u", app->track.miss_frames);
+				break;
+			case TRACK_EGO_BLIND:
+				snprintf(st, sizeof(st), "ego %u", app->track.ego_frames);
+				break;
+			default:
+				snprintf(st, sizeof(st), "%s",
+					 track_state_name(app->track.state));
+				break;
+			}
+		}
+		snprintf(line, sizeof(line), "Track  ·  %s  ·  %s%s%s%s",
+			 app->cam.status, st,
+			 (servo_boot_ready(&app->servo) && app->track.last_cand)
+				 ? "  ·  mot"
+				 : "",
+			 (servo_boot_ready(&app->servo) && app->track.last_hit)
+				 ? "+hit"
+				 : "",
+			 app->servo.ready ? "  ·  servo" : "");
+	}
+	cairo_move_to(cr, 14, 24);
+	cairo_show_text(cr, line);
+
+	if (!app->cam.have_frame) {
+		cairo_set_font_size(cr, 28);
+		cairo_set_source_rgb(cr, 0.55, 0.60, 0.70);
+		cairo_text_extents_t ext;
+		const char *msg = "Waiting for camera…";
+
+		cairo_text_extents(cr, msg, &ext);
+		cairo_move_to(cr, (w - ext.width) / 2.0, h * 0.5);
+		cairo_show_text(cr, msg);
+	}
+
+	cairo_destroy(cr);
+	cairo_surface_destroy(cs);
+}
+
+static struct shm_buffer *pick_buffer(struct app *app)
+{
+	for (int i = 0; i < 2; i++) {
+		struct shm_buffer *b = &app->buffers[app->buffer_idx];
+
+		app->buffer_idx = (app->buffer_idx + 1) % 2;
+		if (!b->busy)
+			return b;
+	}
+	return NULL;
+}
+
+static bool render(struct app *app)
+{
+	int width = app->output_width;
+	int height = app->output_height;
+
+	/* Only paint after xdg_toplevel gave a real size. Using wl_output's
+	 * 2560×1440 against a first fullscreen configure of 0×0 is xdg error 4
+	 * and kills the Wayland connection (black HDMI, stuck panel). */
+	if (width < 1 || height < 1)
+		return false;
+
+	for (int i = 0; i < 2; i++) {
+		if (app->buffers[i].wl_buffer &&
+		    (app->buffers[i].width != width || app->buffers[i].height != height))
+			shm_buffer_destroy(&app->buffers[i]);
+		if (!app->buffers[i].wl_buffer) {
+			if (shm_buffer_init(app, &app->buffers[i], width, height) < 0) {
+				fprintf(stderr, "shm buffer init failed\n");
+				app->running = false;
+				return false;
+			}
+		}
+	}
+
+	struct shm_buffer *b = pick_buffer(app);
+	if (!b)
+		return false;
+
+	draw_panel(app, b);
+	b->busy = true;
+	/* Fullscreen DRM kiosk: keep scale 1 so buffer size == surface size. */
+	wl_surface_set_buffer_scale(app->surface, 1);
+	wl_surface_attach(app->surface, b->wl_buffer, 0, 0);
+	wl_surface_damage_buffer(app->surface, 0, 0, width, height);
+	wl_surface_commit(app->surface);
+	app->last_committed = (int)(b - app->buffers);
+	app->have_committed = true;
+	return true;
+}
+
+/* ---- Wayland ------------------------------------------------------------ */
+
+static void xdg_wm_base_ping(void *data, struct xdg_wm_base *wm, uint32_t serial)
+{
+	(void)data;
+	xdg_wm_base_pong(wm, serial);
+}
+
+static const struct xdg_wm_base_listener wm_base_listener = {
+	.ping = xdg_wm_base_ping,
+};
+
+static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial)
+{
+	struct app *app = data;
+
+	xdg_surface_ack_configure(xdg_surface, serial);
+	/* Weston may send fullscreen configure 0×0 first; wait for a real size.
+	 * Re-commit without a buffer so the compositor sends a sized configure. */
+	if (app->output_width < 1 || app->output_height < 1) {
+		wl_surface_commit(app->surface);
+		return;
+	}
+	app->configured = true;
+	render(app);
+}
+
+static const struct xdg_surface_listener xdg_surface_listener = {
+	.configure = xdg_surface_configure,
+};
+
+static void xdg_toplevel_configure(void *data, struct xdg_toplevel *toplevel,
+				   int32_t width, int32_t height, struct wl_array *states)
+{
+	struct app *app = data;
+
+	(void)toplevel;
+	(void)states;
+	/* Ignore 0×0: that is "compositor has not sized us yet". Painting a
+	 * wl_output mode buffer against fullscreen(0×0) is xdg error 4. */
+	if (width > 0 && height > 0) {
+		app->output_width = width;
+		app->output_height = height;
+	}
+}
+
+static void xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel)
+{
+	struct app *app = data;
+
+	(void)toplevel;
+	app->running = false;
+}
+
+static const struct xdg_toplevel_listener xdg_toplevel_listener = {
+	.configure = xdg_toplevel_configure,
+	.close = xdg_toplevel_close,
+};
+
+static void output_geometry(void *data, struct wl_output *output,
+			    int32_t x, int32_t y, int32_t pw, int32_t ph,
+			    int32_t subpixel, const char *make, const char *model,
+			    int32_t transform)
+{
+	(void)data;
+	(void)output;
+	(void)x;
+	(void)y;
+	(void)pw;
+	(void)ph;
+	(void)subpixel;
+	(void)make;
+	(void)model;
+	(void)transform;
+}
+
+static void output_mode(void *data, struct wl_output *output, uint32_t flags,
+			int32_t width, int32_t height, int32_t refresh)
+{
+	struct app *app = data;
+
+	(void)output;
+	(void)refresh;
+	if (flags & WL_OUTPUT_MODE_CURRENT) {
+		app->mode_width = width;
+		app->mode_height = height;
+	}
+}
+
+static void output_done(void *data, struct wl_output *output)
+{
+	(void)data;
+	(void)output;
+}
+
+static void output_scale(void *data, struct wl_output *output, int32_t factor)
+{
+	struct app *app = data;
+
+	(void)output;
+	app->scale = factor;
+}
+
+static const struct wl_output_listener output_listener = {
+	.geometry = output_geometry,
+	.mode = output_mode,
+	.done = output_done,
+	.scale = output_scale,
+};
+
+static void registry_global(void *data, struct wl_registry *registry,
+			    uint32_t name, const char *interface, uint32_t version)
+{
+	struct app *app = data;
+
+	(void)version;
+	if (strcmp(interface, "wl_compositor") == 0) {
+		app->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
+	} else if (strcmp(interface, "wl_shm") == 0) {
+		app->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+	} else if (strcmp(interface, "xdg_wm_base") == 0) {
+		app->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
+		xdg_wm_base_add_listener(app->wm_base, &wm_base_listener, app);
+	} else if (strcmp(interface, "wl_output") == 0 && !app->output) {
+		app->output = wl_registry_bind(registry, name, &wl_output_interface, 2);
+		wl_output_add_listener(app->output, &output_listener, app);
+	}
+}
+
+static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name)
+{
+	(void)data;
+	(void)registry;
+	(void)name;
+}
+
+static const struct wl_registry_listener registry_listener = {
+	.global = registry_global,
+	.global_remove = registry_global_remove,
+};
+
+int main(int argc, char **argv)
+{
+	struct app app = { 0 };
+	struct pollfd pfds[2];
+	uint64_t last_frame_ms = 0;
+	struct sigaction sa;
+
+	(void)argc;
+	(void)argv;
+
+	app.running = true;
+	app.scale = 1;
+	app.output_width = 0;
+	app.output_height = 0;
+	app.mode_width = 0;
+	app.mode_height = 0;
+	app.cam.fd = -1;
+	app.cam.retry_ms = CAM_RETRY_MS;
+	track_reset(&app.track);
+	snprintf(app.cam.status, sizeof(app.cam.status), "starting");
+
+	app.display = wl_display_connect(NULL);
+	if (!app.display) {
+		fprintf(stderr, "failed to connect to Wayland display\n");
+		return 1;
+	}
+
+	app.registry = wl_display_get_registry(app.display);
+	wl_registry_add_listener(app.registry, &registry_listener, &app);
+	wl_display_roundtrip(app.display);
+	wl_display_roundtrip(app.display);
+
+	if (!app.compositor || !app.shm || !app.wm_base) {
+		fprintf(stderr, "missing compositor/shm/xdg_wm_base\n");
+		return 1;
+	}
+
+	app.surface = wl_compositor_create_surface(app.compositor);
+	app.xdg_surface = xdg_wm_base_get_xdg_surface(app.wm_base, app.surface);
+	xdg_surface_add_listener(app.xdg_surface, &xdg_surface_listener, &app);
+	app.xdg_toplevel = xdg_surface_get_toplevel(app.xdg_surface);
+	xdg_toplevel_add_listener(app.xdg_toplevel, &xdg_toplevel_listener, &app);
+	xdg_toplevel_set_title(app.xdg_toplevel, "Track Panel");
+	xdg_toplevel_set_app_id(app.xdg_toplevel, "info-panel-track");
+	xdg_toplevel_set_fullscreen(app.xdg_toplevel, app.output);
+	wl_surface_commit(app.surface);
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_sigusr1;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGUSR1, &sa, NULL);
+	sa.sa_handler = on_sigusr2;
+	sigaction(SIGUSR2, &sa, NULL);
+
+	cam_find_and_open(&app.cam);
+	app.cam.next_retry_ms = monotonic_ms() + CAM_RETRY_MS;
+	servo_init(&app.servo);
+	sweep_status_write(servo_boot_ready(&app.servo) ? "idle" : "wait");
+
+	while (app.running) {
+		uint64_t now_ms;
+		int npoll = 0;
+		int timeout;
+		int ret;
+		bool had_frame;
+		bool grab_due;
+
+		while (wl_display_prepare_read(app.display) != 0)
+			wl_display_dispatch_pending(app.display);
+		wl_display_flush(app.display);
+
+		now_ms = monotonic_ms();
+		pfds[npoll].fd = wl_display_get_fd(app.display);
+		pfds[npoll].events = POLLIN;
+		npoll++;
+		if (app.cam.fd >= 0) {
+			pfds[npoll].fd = app.cam.fd;
+			pfds[npoll].events = POLLIN;
+			npoll++;
+		}
+
+		if (!app.configured)
+			timeout = 20;
+		else if (now_ms >= last_frame_ms + FRAME_MS)
+			timeout = POLL_MIN_MS;
+		else
+			timeout = (int)(last_frame_ms + FRAME_MS - now_ms);
+
+		if (timeout < POLL_MIN_MS)
+			timeout = POLL_MIN_MS;
+
+		ret = poll(pfds, (nfds_t)npoll, timeout);
+		if (ret < 0 && errno != EINTR) {
+			wl_display_cancel_read(app.display);
+			break;
+		}
+		if (ret > 0 && (pfds[0].revents & POLLIN))
+			wl_display_read_events(app.display);
+		else
+			wl_display_cancel_read(app.display);
+
+		wl_display_dispatch_pending(app.display);
+
+		had_frame = app.cam.have_frame;
+		now_ms = monotonic_ms();
+		grab_due = app.configured && (now_ms - last_frame_ms) >= FRAME_MS;
+
+		if (sweep_requested) {
+			sweep_requested = 0;
+			if (app.servo.enabled && app.servo.ready) {
+				track_reset(&app.track);
+				app.cam.motion_have_prev = false;
+				if (app.cam.have_frame && app.configured)
+					app.servo.boot = SERVO_BOOT_GO;
+				else
+					app.servo.boot = SERVO_BOOT_WAIT_VIDEO;
+				sweep_status_write("running");
+				fprintf(stderr,
+					"info-panel-track: SIGUSR2 → pan sweep %u×\n",
+					SERVO_SWEEP_TRIPS);
+			} else {
+				fprintf(stderr,
+					"info-panel-track: SIGUSR2 ignored (no servo)\n");
+			}
+		}
+
+		if (!servo_boot_ready(&app.servo)) {
+			servo_boot_tick(&app.servo, &app.cam, &app.track,
+					app.cam.have_frame && app.configured,
+					now_ms);
+			app.frame_dirty = true;
+		}
+
+		if (app.cam.fd >= 0 && grab_due) {
+			bool track_on = servo_boot_ready(&app.servo);
+
+			cam_grab(&app.cam, &app.track, track_on);
+			if (track_on)
+				servo_follow_track(&app.servo, &app.cam, &app.track);
+		} else if (app.cam.fd < 0 && now_ms >= app.cam.next_retry_ms) {
+			bool ok = cam_find_and_open(&app.cam);
+
+			app.cam.next_retry_ms = monotonic_ms() +
+				(ok ? CAM_RETRY_MS : (app.cam.retry_ms ? app.cam.retry_ms : CAM_RETRY_MS));
+			if (!ok && app.cam.retry_ms < CAM_RETRY_MAX_MS) {
+				app.cam.retry_ms = app.cam.retry_ms ? app.cam.retry_ms * 2 : CAM_RETRY_MS;
+				if (app.cam.retry_ms > CAM_RETRY_MAX_MS)
+					app.cam.retry_ms = CAM_RETRY_MAX_MS;
+			}
+			app.frame_dirty = true;
+		}
+
+		if (app.cam.have_frame && !had_frame)
+			app.frame_dirty = true;
+		if (app.cam.have_frame && app.cam.fd >= 0 && grab_due)
+			app.frame_dirty = true;
+		else if (app.cam.fd < 0)
+			app.frame_dirty = true;
+
+		now_ms = monotonic_ms();
+		if (app.configured &&
+		    (app.frame_dirty || now_ms - last_frame_ms >= 1000) &&
+		    now_ms - last_frame_ms >= FRAME_MS) {
+			if (render(&app)) {
+				last_frame_ms = now_ms;
+				app.frame_dirty = false;
+			}
+		}
+
+		if (screenshot_requested)
+			dump_screenshot(&app);
+
+		{
+			struct timespec slp = {
+				.tv_sec = 0,
+				.tv_nsec = (long)POLL_MIN_MS * 1000000L,
+			};
+
+			nanosleep(&slp, NULL);
+		}
+	}
+
+	servo_close(&app.servo);
+	cam_close(&app.cam);
+	for (int i = 0; i < 2; i++)
+		shm_buffer_destroy(&app.buffers[i]);
+	if (app.xdg_toplevel)
+		xdg_toplevel_destroy(app.xdg_toplevel);
+	if (app.xdg_surface)
+		xdg_surface_destroy(app.xdg_surface);
+	if (app.surface)
+		wl_surface_destroy(app.surface);
+	if (app.output)
+		wl_output_destroy(app.output);
+	if (app.wm_base)
+		xdg_wm_base_destroy(app.wm_base);
+	if (app.shm)
+		wl_shm_destroy(app.shm);
+	if (app.compositor)
+		wl_compositor_destroy(app.compositor);
+	if (app.registry)
+		wl_registry_destroy(app.registry);
+	wl_display_disconnect(app.display);
+	return 0;
+}

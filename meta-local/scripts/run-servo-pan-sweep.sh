@@ -1,5 +1,5 @@
 #!/bin/bash
-# SSH to the Orange Pi 3: record AC200 MIC1, play that WAV over HDMI.
+# SSH to the Orange Pi 3 and run /usr/sbin/servo-pan-sweep (edge↔edge ×3 → center).
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -7,9 +7,7 @@ ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
 TARGET="${TARGET:-root@192.168.3.73}"
 SSH_KEY="${SSH_KEY:-$ROOT/meta-local/recipes-core/root-ssh-keys/files/id_ed25519}"
-DURATION_SEC="${DURATION_SEC:-5}"
-STOP_INFO_PANEL="${STOP_INFO_PANEL:-1}"
-KEEP_WAV="${KEEP_WAV:-0}"
+TIMEOUT_SEC="${TIMEOUT_SEC:-45}"
 
 SSH_OPTS=(
 	-i "$SSH_KEY"
@@ -28,19 +26,18 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*"; }
 
 usage() {
-	cat <<'EOF_USAGE'
-Usage: run-ac200-mic-hdmi-play.sh
+	cat <<'EOF'
+Usage: run-servo-pan-sweep.sh
 
-  On the board: record MIC1, then play the WAV over HDMI speakers.
+  On the board: signal info-panel-track to pan edge↔edge three times,
+  then park the camera at center (same as the boot sweep).
 
 Environment:
   TARGET=root@192.168.3.73
   SSH_KEY=meta-local/recipes-core/root-ssh-keys/files/id_ed25519
   SSH_BIND=192.168.3.6
-  DURATION_SEC=5
-  STOP_INFO_PANEL=1
-  KEEP_WAV=0
-EOF_USAGE
+  TIMEOUT_SEC=45
+EOF
 }
 
 case "${1:-}" in
@@ -53,18 +50,16 @@ esac
 [ -f "$SSH_KEY" ] || die "SSH private key not found: $SSH_KEY"
 command -v ssh >/dev/null || die "ssh not found"
 
-# Record + playback wall time, plus slack for stop/start info-panel.
-ssh_wait=$((DURATION_SEC * 2 + 60))
-log "==> SSH $TARGET → ac200-mic-hdmi-play (record ${DURATION_SEC}s, then HDMI)"
+ssh_wait=$((TIMEOUT_SEC + 30))
+log "==> SSH $TARGET → servo-pan-sweep (timeout ${TIMEOUT_SEC}s)"
 set +e
 ssh "${SSH_OPTS[@]}" -o "ServerAliveCountMax=$((ssh_wait / 5 + 2))" "$TARGET" \
-	"command -v ac200-mic-hdmi-play >/dev/null || exit 127; \
-	 DURATION_SEC=$DURATION_SEC STOP_INFO_PANEL=$STOP_INFO_PANEL \
-	 KEEP_WAV=$KEEP_WAV ac200-mic-hdmi-play"
+	"command -v servo-pan-sweep >/dev/null || exit 127; \
+	 TIMEOUT_SEC=$TIMEOUT_SEC servo-pan-sweep"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then
-	[ "$rc" = "127" ] && die "ac200-mic-hdmi-play not found on target (rebuild/flash with ac200-audio)"
-	die "ac200-mic-hdmi-play failed on $TARGET (exit $rc)"
+	[ "$rc" = "127" ] && die "servo-pan-sweep not found on target (flash INFO_PANEL=track image)"
+	die "servo-pan-sweep failed on $TARGET (exit $rc)"
 fi
 log "RESULT: PASS"

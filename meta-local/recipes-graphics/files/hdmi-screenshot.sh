@@ -1,9 +1,10 @@
 #!/bin/sh
 # Capture the live HDMI info-panel frame (last committed wl_shm buffer) to PNG.
 #
-# Works with either info-panel (stats) or info-panel-camera: both dump to
-# /tmp/info-panel-screenshot.png on SIGUSR1. This helper signals whichever
-# is running, waits for the atomic rename, then copies to DEST or stdout.
+# Works with info-panel (stats), info-panel-camera, or info-panel-track:
+# each dumps to /tmp/info-panel-screenshot.png on SIGUSR1. This helper
+# signals whichever is running, waits for the atomic rename, then copies
+# to DEST or stdout.
 set -eu
 
 SHOT_PNG="/tmp/info-panel-screenshot.png"
@@ -25,13 +26,13 @@ EOF
 log() { printf '%s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Prefer camera if both somehow run; only one is in a given image.
-# /proc/comm is 15 chars — "info-panel-camera" appears as "info-panel-came".
+# Prefer track/camera if several somehow run; only one is in a given image.
+# /proc/comm is 15 chars — "info-panel-camera" / "info-panel-track" truncate.
 panel_pid() {
 	pid=""
 	name=""
 	if command -v pidof >/dev/null 2>&1; then
-		for n in info-panel-camera info-panel; do
+		for n in info-panel-track info-panel-camera info-panel; do
 			pid=$(pidof "$n" 2>/dev/null || true)
 			pid=${pid%% *}
 			if [ -n "$pid" ]; then
@@ -44,6 +45,9 @@ panel_pid() {
 		for d in /proc/[0-9]*; do
 			c=$(cat "$d/comm" 2>/dev/null || true)
 			case "$c" in
+			info-panel-trac|info-panel-track)
+				name=info-panel-track
+				;;
 			info-panel-came|info-panel-camera)
 				name=info-panel-camera
 				;;
@@ -81,7 +85,7 @@ case "${1:-}" in
 	;;
 esac
 
-info=$(panel_pid) || die "info-panel / info-panel-camera is not running"
+info=$(panel_pid) || die "info-panel / info-panel-camera / info-panel-track is not running"
 pid=${info%% *}
 panel=${info#* }
 

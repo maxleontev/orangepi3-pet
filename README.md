@@ -129,13 +129,15 @@ Must run as root. After success: power off, remove the SD card, power on
 ### On target: `hdmi-screenshot` (`/usr/sbin/hdmi-screenshot`)
 
 Dumps the live HDMI panel frame (last committed Wayland SHM buffer) to PNG.
-Installed by whichever panel recipe is in the image (`info-panel` or
-`info-panel-camera`). That panel process must be running.
-`info-panel-camera` also draws a yellow motion bbox (densest changed
-blob; ignores weak/global noise) and, when a hobby servo is on CON12
-pin 7 (HW PWM0 / PD22), PID-pans only on fresh blob measurements
-(`INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1` flips pan
-direction from the camera-on-servo default).
+Installed by whichever panel recipe is in the image (`info-panel`,
+`info-panel-camera`, or `info-panel-track`). That panel process must be running.
+
+`info-panel-camera` draws a yellow motion bbox (legacy frame-diff) and may
+PID-pan a hobby servo on CON12 pin 7 (HW PWM0 / PD22).
+`info-panel-track` is the redesigned follow panel (block-energy motion →
+FSM; white acquire / yellow lock bbox; servo only while locked).
+`INFO_PANEL_SERVO=0` disables; `INFO_PANEL_SERVO_INVERT=1`
+flips pan direction from the camera-on-servo default.
 
 ```bash
 hdmi-screenshot                  # TTY: /tmp/hdmi-screenshot.png (prints path)
@@ -150,6 +152,25 @@ hdmi-screenshot /data/hdmi.png
 
 This is the compositor client buffer, not a photograph of the monitor.
 Host wrapper: [`pull-hdmi-screenshot.sh`](meta-local/scripts/README.md#pull-hdmi-screenshot).
+
+<a id="servo-pan-sweep"></a>
+### On target: `servo-pan-sweep` (`/usr/sbin/servo-pan-sweep`)
+
+Ask the running `info-panel-track` to pan the camera edge↔edge three times,
+then park at center (same sequence as the boot sweep). Sends `SIGUSR2`;
+status is `/tmp/info-panel-track.sweep`.
+
+```bash
+servo-pan-sweep
+TIMEOUT_SEC=60 servo-pan-sweep
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TIMEOUT_SEC` | `45` | Fail if sweep does not reach `idle` |
+| `STATUS_PATH` | `/tmp/info-panel-track.sweep` | Panel sweep status file |
+
+Host wrapper: [`run-servo-pan-sweep.sh`](meta-local/scripts/README.md#run-servo-pan-sweep).
 
 <a id="ac200-mic-hdmi-play"></a>
 ### On target: `ac200-mic-hdmi-play` (`/usr/sbin/ac200-mic-hdmi-play`)

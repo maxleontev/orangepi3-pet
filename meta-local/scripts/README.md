@@ -92,7 +92,7 @@ No positional arguments. Override via environment:
 
 | Env | Default | Description |
 |-----|---------|-------------|
-| `TARGET` | `root@192.168.3.71` | SSH target |
+| `TARGET` | `root@192.168.3.73` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs (`192.168.3.6` ethernet, `192.168.3.37` WiFi) |
 | `REMOTE_DIR` | `/data/update` | Remote directory for the bundle |
@@ -116,13 +116,33 @@ SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
 | Argument / env | Default | Description |
 |----------------|---------|-------------|
 | `OUT` (optional positional) | `$PWD/hdmi.png` | Local PNG path (auto-numbered if taken) |
-| `TARGET` | `root@192.168.3.71` | SSH target |
+| `TARGET` | `root@192.168.3.73` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs |
 | `TIMEOUT_SEC` | `8` | Seconds for info-panel to write the frame on the board |
 
-Requires a live `info-panel` or `info-panel-camera` on the target. This is the compositor client buffer,
+Requires a live `info-panel`, `info-panel-camera`, or `info-panel-track` on the target. This is the compositor client buffer,
 not a photograph of the monitor.
+
+<a id="run-servo-pan-sweep"></a>
+## `run-servo-pan-sweep.sh`
+
+SSHs to the board and runs `/usr/sbin/servo-pan-sweep` (`info-panel-track`
+`SIGUSR2`: edge↔edge ×3, then center — same as the boot sweep).
+
+```bash
+SSH_BIND=192.168.3.6 TARGET=root@192.168.3.73 \
+  meta-local/scripts/run-servo-pan-sweep.sh
+```
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `TARGET` | `root@192.168.3.73` | SSH target |
+| `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
+| `SSH_BIND` | | Bind address when the host has dual NICs |
+| `TIMEOUT_SEC` | `45` | Passed through to on-target tool |
+
+Requires a live `info-panel-track` with servo enabled.
 
 <a id="run-ac200-mic-hdmi-play"></a>
 ## `run-ac200-mic-hdmi-play.sh`
@@ -140,7 +160,7 @@ DURATION_SEC=20 SSH_BIND=192.168.3.6 meta-local/scripts/run-ac200-mic-hdmi-play.
 | `DURATION_SEC` | `5` | Capture length in seconds |
 | `STOP_INFO_PANEL` | `1` | Stop info-panel around capture |
 | `KEEP_WAV` | `0` | Keep temp WAV on the board |
-| `TARGET` | `root@192.168.3.71` | SSH target |
+| `TARGET` | `root@192.168.3.73` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs |
 
@@ -169,7 +189,7 @@ after reflash).
 
 | Env | Default | Description |
 |-----|---------|-------------|
-| `TARGET` | `root@192.168.3.71` | SSH target |
+| `TARGET` | `root@192.168.3.73` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Root private key |
 | `REMOTE_DIR` | `/data/update` | Remote directory for bundles |
 | `DEPLOY` | `build-orangepi3/tmp/deploy/images/orange-pi-3` | Deploy dir for good/bad artifacts |

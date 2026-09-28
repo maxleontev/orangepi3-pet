@@ -12,7 +12,7 @@ set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 
-TARGET="${TARGET:-root@192.168.3.71}"
+TARGET="${TARGET:-root@192.168.3.73}"
 SSH_KEY="${SSH_KEY:-$ROOT/meta-local/recipes-core/root-ssh-keys/files/id_ed25519}"
 REMOTE_DIR="${REMOTE_DIR:-/data/update}"
 DEPLOY="${DEPLOY:-$ROOT/build-orangepi3/tmp/deploy/images/orange-pi-3}"
@@ -36,7 +36,7 @@ Usage: test-ab-update-scheme.sh
   Run good, bad-rootfs, and bad-FIT A/B tests over SSH.
 
 Environment:
-  TARGET         SSH target (default root@192.168.3.71)
+  TARGET         SSH target (default root@192.168.3.73)
   SSH_KEY        Private key for root
   REMOTE_DIR     Remote work dir (default /data/update)
   DEPLOY         Yocto deploy images dir

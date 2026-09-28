@@ -7,7 +7,8 @@ DISTRO_FEATURES:remove = "x11"
 # Which fullscreen HDMI client core-image-khepri installs (exactly one):
 #   stats  — info-panel (CPU/mem/IP + AC200 mic spectrum)  [default]
 #   camera — info-panel-camera (live USB UVC preview)
-# Override in local.conf, e.g. INFO_PANEL = "camera"
+#   track  — info-panel-track (UVC preview + redesigned servo follow)
+# Override in local.conf, e.g. INFO_PANEL = "track"
 INFO_PANEL ??= "stats"
 
 # Mainline Lima instead of proprietary sunxi-mali binaries.
