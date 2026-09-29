@@ -1,8 +1,22 @@
 # Orange Pi 3 Yocto Build
 
-This repository contains a Yocto Project setup for building a custom Linux
-distribution for the **Orange Pi 3** single-board computer (image
-`core-image-khepri`).
+Custom Linux image (`core-image-khepri`) for the **Orange Pi 3** (Allwinner
+H6), built with the Yocto Project. It is a personal board bring-up: HDMI
+info panel under Weston, onboard Ethernet and Wi‑Fi (including a first-boot
+setup AP), AC200 audio, and A/B rootfs updates over SSH so you can rebuild
+and flash without rewriting the SD card each time.
+
+The custom layer [`meta-local/`](meta-local/) is MIT. Upstream layers under
+`poky/`, `meta-sunxi/`, `meta-arm/`, and `meta-openembedded/` keep their own
+licenses. Some firmware packages stay `CLOSED` and are not covered by MIT.
+See [`LICENSE`](LICENSE).
+
+Build uses `MACHINE=orange-pi-3` from
+[`meta-local/conf/machine/orange-pi-3.conf`](meta-local/conf/machine/orange-pi-3.conf)
+(selected in `build-orangepi3/conf/local.conf`). That machine is not stock
+`meta-sunxi` (upstream has `orange-pi-3lts` only): it reuses the LTS H6 BSP
+and overrides DTB, U-Boot, and Wi‑Fi for the non-LTS board. Details are in
+the conf file comments.
 
 ## First-time setup
 
@@ -66,6 +80,27 @@ see [`meta-local/scripts/README.md`](meta-local/scripts/README.md).
 
 On-target tools are installed into the image as `/usr/sbin/*` from
 `meta-local/recipes-support/`.
+
+<a id="eth-connect"></a>
+### On target: `eth-connect` (`/usr/sbin/eth-connect`)
+
+Brings up onboard Ethernet and runs DHCP. Started by `eth.service` at boot.
+Stack map (DTS, modules, recipe):
+[`meta-local/recipes-support/eth-init/README.md`](meta-local/recipes-support/eth-init/README.md).
+
+```bash
+eth-connect
+IFACE=end0 DHCP_METRIC=50 eth-connect
+```
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `IFACE` | first wired (`eth0` / `end0`, …) | Netdev to configure |
+| `WAIT_IFACE_SEC` | `30` | Seconds to wait for the iface to appear |
+| `DHCP_METRIC` | `50` | Metric on the default route from this iface |
+
+Must run as root. Exits `0` if no ethernet iface shows up (so boot is not
+blocked when the cable or PHY is missing).
 
 <a id="ab-update"></a>
 ### On target: `ab-update` (`/usr/sbin/ab-update`)
