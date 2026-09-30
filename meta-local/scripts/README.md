@@ -85,14 +85,14 @@ confirmed (`upgrade_available=0`, `bootcount=0`, slot switched). Prints one of:
 - `RESULT: FAIL (verification didn't pass)` — SSH up, but slot/confirm checks failed
 
 ```bash
-SSH_BIND=192.168.3.6 meta-local/scripts/push-ab-update.sh
+SSH_BIND=<host-ip> meta-local/scripts/push-ab-update.sh
 ```
 
 No positional arguments. Override via environment:
 
 | Env | Default | Description |
 |-----|---------|-------------|
-| `TARGET` | `root@192.168.3.73` | SSH target |
+| `TARGET` | `root@<board-ip>` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs (`192.168.3.6` ethernet, `192.168.3.37` WiFi) |
 | `REMOTE_DIR` | `/data/update` | Remote directory for the bundle |
@@ -110,13 +110,13 @@ saves the PNG on the host. Existing files are not overwritten: if `hdmi.png`
 is present, the next shot is `hdmi-0001.png`, then `hdmi-0002.png`, and so on.
 
 ```bash
-SSH_BIND=192.168.3.6 meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
+SSH_BIND=<host-ip> meta-local/scripts/pull-hdmi-screenshot.sh /tmp/hdmi.png
 ```
 
 | Argument / env | Default | Description |
 |----------------|---------|-------------|
 | `OUT` (optional positional) | `$PWD/hdmi.png` | Local PNG path (auto-numbered if taken) |
-| `TARGET` | `root@192.168.3.73` | SSH target |
+| `TARGET` | `root@<board-ip>` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs |
 | `TIMEOUT_SEC` | `8` | Seconds for info-panel to write the frame on the board |
@@ -131,13 +131,12 @@ SSHs to the board and runs `/usr/sbin/servo-pan-sweep` (`info-panel-track`
 `SIGUSR2`: edge↔edge ×3, then center — same as the boot sweep).
 
 ```bash
-SSH_BIND=192.168.3.6 TARGET=root@192.168.3.73 \
-  meta-local/scripts/run-servo-pan-sweep.sh
+SSH_BIND=<host-ip> TARGET=root@<board-ip> meta-local/scripts/run-servo-pan-sweep.sh
 ```
 
 | Env | Default | Description |
 |-----|---------|-------------|
-| `TARGET` | `root@192.168.3.73` | SSH target |
+| `TARGET` | `root@<board-ip>` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs |
 | `TIMEOUT_SEC` | `45` | Passed through to on-target tool |
@@ -152,7 +151,7 @@ then play that WAV over HDMI (monitor speakers). Stops `info-panel` for the
 capture and starts it again after playback.
 
 ```bash
-DURATION_SEC=20 SSH_BIND=192.168.3.6 meta-local/scripts/run-ac200-mic-hdmi-play.sh
+DURATION_SEC=20 SSH_BIND=<host-ip> meta-local/scripts/run-ac200-mic-hdmi-play.sh
 ```
 
 | Env | Default | Description |
@@ -160,7 +159,7 @@ DURATION_SEC=20 SSH_BIND=192.168.3.6 meta-local/scripts/run-ac200-mic-hdmi-play.
 | `DURATION_SEC` | `5` | Capture length in seconds |
 | `STOP_INFO_PANEL` | `1` | Stop info-panel around capture |
 | `KEEP_WAV` | `0` | Keep temp WAV on the board |
-| `TARGET` | `root@192.168.3.73` | SSH target |
+| `TARGET` | `root@<board-ip>` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Private key for root |
 | `SSH_BIND` | | Bind address when the host has dual NICs |
 
@@ -189,7 +188,7 @@ after reflash).
 
 | Env | Default | Description |
 |-----|---------|-------------|
-| `TARGET` | `root@192.168.3.73` | SSH target |
+| `TARGET` | `root@<board-ip>` | SSH target |
 | `SSH_KEY` | `meta-local/recipes-core/root-ssh-keys/files/id_ed25519` | Root private key |
 | `REMOTE_DIR` | `/data/update` | Remote directory for bundles |
 | `DEPLOY` | `build-orangepi3/tmp/deploy/images/orange-pi-3` | Deploy dir for good/bad artifacts |

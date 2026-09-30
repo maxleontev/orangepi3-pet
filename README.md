@@ -63,7 +63,7 @@ bitbake core-image-khepri
 6. On first boot `/data` has no Wi-Fi networks, so the board opens the setup
    AP (`Khepri-Setup-<mac4>`, `http://192.168.4.1/`). Save a network there;
    see [WiFi](meta-local/recipes-wifi/README.md#setup-web-ui). After it joins
-   the LAN, SSH to `root@192.168.3.71` with the key from step 1.
+   the LAN, SSH to `root@<board-ip>` with the key from step 1.
 
 7. To move the install onto onboard eMMC, run
    [`sd-to-emmc`](#sd-to-emmc) from the booted SD system, power off, remove
